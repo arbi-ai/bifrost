@@ -4,7 +4,9 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
 	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/modelcatalog"
@@ -58,4 +60,45 @@ func TestAttributeRoutingEmbeddingCostWithoutStoreOrCatalog(t *testing.T) {
 	// A plugin whose catalog or store never got wired must not panic; the
 	// usage is simply unattributable.
 	(&GovernancePlugin{}).AttributeRoutingEmbeddingCost("openai", "text-embedding-3-small", 1000)
+}
+
+func TestPostHookWorkerAddsRoutingCostToProviderUsageOnError(t *testing.T) {
+	fixture := newAccountingFixture(t)
+	plugin := &GovernancePlugin{
+		ctx:          context.Background(),
+		tracker:      fixture.tracker,
+		modelCatalog: newOfflinePricingCatalog(t),
+	}
+
+	provider, model, routingTokens := "openai", "text-embedding-3-small", 13
+	routingDebug := &schemas.BifrostRoutingDebug{
+		ProviderUsed:       &provider,
+		ModelUsed:          &model,
+		InputTokens:        &routingTokens,
+		CountTowardBudgets: true,
+	}
+	billedUsage := &schemas.BifrostLLMUsage{
+		PromptTokens:     100,
+		CompletionTokens: 50,
+		TotalTokens:      150,
+	}
+	bifrostErr := &schemas.BifrostError{
+		Error: &schemas.ErrorField{Message: "provider failed"},
+		ExtraFields: schemas.BifrostErrorExtraFields{
+			BilledUsage: billedUsage,
+		},
+	}
+
+	plugin.postHookWorker(nil, bifrostErr, schemas.OpenAI, "gpt-4o", schemas.ChatCompletionRequest, "sk-bf-acct", "routing-error", "", false, 0, nil, routingDebug)
+
+	// gpt-4o testdata: 2.5e-6 input, 1e-5 output. Routing embedding:
+	// text-embedding-3-small at 2e-8/input token. Both calls are billable.
+	want := float64(100)*2.5e-6 + float64(50)*1e-5 + float64(routingTokens)*2e-8
+	// postHookWorker hands the update to the tracker, which the plugin treats as
+	// an asynchronous queue. Poll for the settled total instead of sleeping for a
+	// fixed interval that is either wasted time or, if the tracker ever moves the
+	// work off the caller's goroutine, too short.
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.InDelta(c, want, fixture.cost(), 1e-12)
+	}, time.Second, 10*time.Millisecond)
 }
