@@ -268,7 +268,35 @@ func parseTreeAuthored(t *testing.T, src string) *exec.Template {
 
 // Regression for the failure mode that broke the untrusted walker twice: a
 // fail-closed switch missing a case rejects everything.
+// Iterates a sample keyed by structure name and asserts the sample covers
+// AuthoredAllowed exactly, so the test cannot drift from the set it guards.
+// An earlier draft hand-listed the cases and silently omitted call, trans,
+// break and continue — two of which are exactly what the wrapper regression
+// breaks.
 func TestAuthoredGuardAcceptsEveryAllowedStructure(t *testing.T) {
+	samples := map[string]string{
+		"if": `{% if a %}x{% endif %}`, "for": `{% for a in xs %}{{ a }}{% endfor %}`,
+		"raw": `{% raw %}{{ lit }}{% endraw %}`, "macro": `{% macro m() %}x{% endmacro %}`,
+		"call":  `{% macro m() %}{{ caller() }}{% endmacro %}{% call m() %}x{% endcall %}`,
+		"do":    `{% do xs.append(1) %}`, "autoescape": `{% autoescape true %}{{ a }}{% endautoescape %}`,
+		"trans": `{% trans %}hello{% endtrans %}`, "block": `{% block b %}x{% endblock %}`,
+		"include": `{% include '/p' %}`, "import": `{% import '/p' as p %}`,
+		"from":  `{% from '/p' import thing %}`,
+		"break": `{% for a in xs %}{% break %}{% endfor %}`,
+		"continue": `{% for a in xs %}{% continue %}{% endfor %}`,
+	}
+	for _, name := range engine.AuthoredAllowed {
+		require.Contains(t, samples, name, "no sample for allowed structure %q", name)
+	}
+	for name, src := range samples {
+		t.Run(name, func(t *testing.T) {
+			tpl := parseTreeAuthored(t, src)
+			require.NoError(t, engine.AuthoredGuardLoops(tpl.Root(), 4))
+		})
+	}
+}
+
+func TestAuthoredGuardAcceptsPlainTemplates(t *testing.T) {
 	for _, src := range []string{
 		`{% if a %}x{% endif %}`,
 		`{% for a in xs %}{{ a }}{% endfor %}`,
@@ -278,8 +306,6 @@ func TestAuthoredGuardAcceptsEveryAllowedStructure(t *testing.T) {
 		`{% import '/p' as p %}`,
 		`{% from '/p' import thing %}`,
 		`{% block b %}x{% endblock %}`,
-		`{% do xs.append(1) %}`,
-		`{% autoescape true %}{{ a }}{% endautoescape %}`,
 		`plain {{ v }}`,
 	} {
 		tpl := parseTreeAuthored(t, src)
@@ -358,6 +384,27 @@ func AuthoredGuardLoops(root *nodes.Template, maxDepth int) error {
 ```
 
 Model `authoredWalkNode` on `walkNode` in `engine/astguard.go` — same `*nodes.ControlStructureBlock` unwrapping, same `For` depth handling (`BodyWrapper` at depth+1, `EmptyWrapper` at depth), same `If` sibling-branch handling. Add cases for `MacroControlStructure` (walk `.Macro.Wrapper`), `CallControlStructure` (`.Body`), `AutoescapeControlStructure` (`.Wrapper`), `TransControlStructure` (`.SingularBody`, `.PluralBody`), and leaf cases for `do`, `block`, `include`, `import`, `from`, `break`, `continue`.
+
+**Wrappers must be unwrapped, or this breaks at Task 4.** Tasks 3 and 4 replace the `macro` and include-family parsers, after which the tree holds the *wrapper* types — not `*controlStructures.MacroControlStructure` or `*IncludeControlStructure` — and a switch listing only the builtin types rejects all five as unwalkable.
+
+The ordering makes this especially nasty: at Task 2 the guards are no-op stubs, so the tree holds builtin types and the test below **passes**. Tasks 3 and 4 then silently regress it, and neither of their test suites calls `AuthoredGuardLoops`, so nothing fails until Task 7.
+
+Give both wrappers an `Unwrap() nodes.ControlStructure` method and have the walker unwrap before the type switch:
+
+```go
+type unwrapper interface{ Unwrap() nodes.ControlStructure }
+
+func authoredWalkNode(n nodes.Node, depth, maxDepth int) error {
+	if u, ok := n.(unwrapper); ok {
+		return authoredWalkNode(u.Unwrap(), depth, maxDepth)
+	}
+	switch typed := n.(type) {
+	// ...
+	}
+}
+```
+
+That absorbs any future wrapper automatically instead of requiring the case list to be updated in lockstep. **Task 4 gains a final step: re-run `TestAuthoredGuard` and confirm it still passes with both wrappers installed.**
 
 **Implementer note:** confirm each concrete type name and field against the module cache before writing the case — `builtins/control_structures/`. Do not guess; a wrong type name compiles to a missing case, which fails closed and breaks authored rendering silently until a test catches it. That is precisely how the untrusted walker broke twice.
 
@@ -487,11 +534,46 @@ func (g *guardedMacro) Execute(r *exec.Renderer, tag *nodes.ControlStructureBloc
 }
 ```
 
-`installMacroGuard` replaces the `"macro"` entry with a parser that calls the builtin `macroParser`, type-asserts the result to `*controlStructures.MacroControlStructure`, and returns `&guardedMacro{...}`.
+`installMacroGuard` replaces the `"macro"` entry with a parser that calls the builtin `macroParser`, type-asserts the result to `*controlStructures.MacroControlStructure`, and returns `&guardedMacro{...}`. Give `guardedMacro` an `Unwrap() nodes.ControlStructure` method returning the embedded builtin, so `AuthoredGuardLoops` can descend into it (Task 2).
 
 **Why interception works:** a recursive call resolves the macro name through the render context, and the context holds the *wrapped* func — so recursion re-enters the counter rather than the raw macro.
 
-**Implementer note:** returning an error as a `*exec.Value` is how gonja surfaces failures from a `Macro`; verify how `exec.AsValue` of an `error` propagates and adjust if the error is swallowed. If it is, return a sentinel value and check it in Task 7's renderer. Confirm before assuming.
+### The error does NOT propagate through `exec.AsValue` — this is the part to get right
+
+Returning `exec.AsValue(ErrMacroTooDeep)` from inside the macro closure **loses the sentinel identity**. `*exec.Value` has `Error() string` (`exec/value.go:125`) but no `Unwrap()`, so `errors.Is` returns false while the message text survives. A test asserting `require.ErrorIs(err, ErrMacroTooDeep)` fails; only a string match passes. The include path (Task 4) is unaffected because it returns a plain Go `error` from `Execute`, which gonja's `errors.Wrapf` chains correctly — that asymmetry is the whole explanation.
+
+Do not assert on message text as a workaround. Re-type the error after `Execute` instead:
+
+```go
+// macroState is the per-render trip flag. It MUST be supplied by the caller and
+// placed into the data context BEFORE Execute — see below.
+type macroState struct{ tripped bool }
+
+const macroStateKey = "__bpt_macro_state__"
+
+// inside the wrapped macro closure:
+if depth >= g.maxDepth {
+    if st, ok := r.Environment.Context.Get(macroStateKey).(*macroState); ok {
+        st.tripped = true
+    }
+    return exec.AsValue(ErrMacroTooDeep) // text only; identity restored below
+}
+
+// WrapMacroError re-types a render error when the macro guard tripped, so
+// errors.Is(err, ErrMacroTooDeep) holds for callers.
+func WrapMacroError(execErr error, st *macroState) error {
+    if execErr != nil && st != nil && st.tripped {
+        return fmt.Errorf("%w: %v", ErrMacroTooDeep, execErr)
+    }
+    return execErr
+}
+```
+
+**The trip flag must be caller-supplied, seeded into the `data` context before `Execute`.** Creating it lazily inside the guard does not work: `Template.Execute` renders against `t.environment.Context.Inherit().Update(data)`, so a box created inside the renderer lives in a *child* context that is discarded when `Execute` returns — the caller never sees `tripped`. An implementation that does this reports `errors.Is == false` on every case while appearing to work.
+
+This is the same `Inherit()` shadowing hazard as Task 4's `depthBox`, with the **opposite** resolution: `include` needs its box visible *downward* to nested renderers, so lazy creation is fine there; `macro` needs its flag visible *upward* to the caller, so it must be seeded from outside. Task 7's renderer allocates a `*macroState` per render, puts it in the variable map, and calls `WrapMacroError` on the result.
+
+Verify no false positives: a legitimate macro, three-level nesting, and an undefined-variable error must all leave `errors.Is(err, ErrMacroTooDeep)` false.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -607,7 +689,7 @@ git commit -m "feat(partials): tenant-scoped partial registry and loader"
 
 **Interfaces:**
 - Produces:
-  - `type CacheKey struct{ TenantID string; PromptID string; Version int; PartialFingerprint string }`
+  - `type CacheKey struct{ TenantID string; PromptID string; Version int; PartialFingerprint string; SourceHash string }`
   - `type Cache struct{ ... }`
   - `func NewCache(max int) *Cache`
   - `func (c *Cache) GetOrCompile(k CacheKey, compile func() (*exec.Template, error)) (*exec.Template, error)`
@@ -629,7 +711,7 @@ func TestCacheKeyIsolatesTenants(t *testing.T) {
 }
 ```
 
-Also cover: identical keys hit the cache (compile called once); a changed partial fingerprint misses; a changed resolved version misses; and concurrent `GetOrCompile` for the same key is safe under `-race`.
+Also cover: identical keys hit the cache (compile called once); a changed partial fingerprint misses; a changed resolved version misses; concurrent `GetOrCompile` for the same key is safe under `-race`; and — the P1 regression — **rendering three different messages of the same prompt version returns three different results**, not the first one three times.
 
 - [ ] **Step 2: Run it to verify it fails**
 
@@ -640,9 +722,25 @@ Expected: FAIL — `undefined: engine.NewCache`.
 
 A mutex-guarded map keyed on the `CacheKey` struct, with a simple size bound.
 
+**`SourceHash` is not optional.** A prompt version holds N messages and each is
+rendered separately, so without a per-message discriminator all N share one key and
+`GetOrCompile` returns the first message's compiled template for every one of them:
+
+```
+message[0] "SYSTEM: you are a support agent for {{ company }}." -> "SYSTEM: ...for Acme."
+message[1] "USER: my order {{ order_id }} is late."             -> "SYSTEM: ...for Acme."  WRONG
+message[2] "ASSISTANT: let me check {{ order_id }}."            -> "SYSTEM: ...for Acme."  WRONG
+```
+
+Same failure class as the tenant leak this task exists to fix: wrong content, no error,
+fails open. Hash `src` rather than using the message index — a hash stays correct even if
+message ordering changes.
+
 **Key on the RESOLVED version, never the requested one.** With no `x-bf-prompt-version` header the resolver returns the prompt's latest version; keying on the requested version — absent, i.e. 0 — serves the stale compiled template forever after a new version is published.
 
 A shared `*exec.Template` is safe for concurrent `Execute`: it builds a fresh `Environment` with `Context.Inherit()` per call, and `{% set %}` does not leak across renders. No per-request compilation or locking of the template itself is needed.
+
+**What else the cache pins.** `Template.Execute` uses `t.loader`, `t.config` *and* `t.environment`, all fixed at compile time. So `StrictUndefined` and the `maxDepth` values baked into the macro and include wrappers are pinned too. That is harmless while `AuthoredLimits()` is a global constant, which it is today — but if limits ever become per-tenant or hot-reloadable, they must join the key or the first tenant's limits will silently apply to everyone.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -665,7 +763,7 @@ git commit -m "feat(engine): tenant-aware template cache"
 - Test: `engine/authored_test.go`
 
 **Interfaces:**
-- Consumes: everything above, plus `Budget`, `GuardExpressions`, `GuardExpressionNodes`, `CheckIterables`, `AsMissingVariables`.
+- Consumes: everything above, plus `Budget`, `GuardExpressions`, `GuardExpressionNodes`, `CheckIterables`, `AsMissingVariables`, `WrapMacroError`.
 - Produces:
   - `type Authored struct{ ... }`
   - `func NewAuthored(limits Limits, cache *Cache) *Authored`
@@ -691,7 +789,7 @@ Order of operations, mirroring `Untrusted.Render` and for the same reasons:
 3. `CheckIterables` on the variable map.
 4. `cache.GetOrCompile` with the tenant-bearing key; the compile func builds the loader from `set` and calls `exec.NewTemplate`.
 5. `AuthoredGuardLoops` and `GuardExpressionNodes` on the parse tree.
-6. Execute inside the panic barrier, writing through `budget.Writer`.
+6. Allocate a `*macroState`, add it to the variable map under `macroStateKey`, execute inside the panic barrier writing through `budget.Writer`, then pass the result through `WrapMacroError` so `errors.Is(err, ErrMacroTooDeep)` holds.
 
 Steps 5 and 6 run on **every** render, not only on a cache miss — a cached tree still needs its guards applied, and `budget` is per-request.
 
