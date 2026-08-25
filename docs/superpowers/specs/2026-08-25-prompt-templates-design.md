@@ -1,7 +1,7 @@
 # Prompt Templates Plugin — Design
 
 **Date:** 2026-08-25
-**Status:** Revised after adversarial review — awaiting re-approval
+**Status:** Approved 2026-08-25, after adversarial review and revision
 **Revision:** The single-environment sandbox was replaced with two isolated render
 environments after review found three process-level DoS vectors and a data-exfiltration
 primitive reachable from an ordinary chat message. See "Two render environments" and
@@ -154,9 +154,9 @@ references cannot bound it. The depth guard must live inside the control structu
 
 ### Untrusted environment — client-sent messages
 
-Built with `exec.NewControlStructureSet` containing only: `if`, `for`, `raw`, `with`, and the
-**assignment** form of `set`. Everything else is a parse error, which is the correct failure
-mode — it triggers the verbatim fallback before any execution occurs.
+Built with `exec.NewControlStructureSet` containing only: `if`, `for`, `raw`, and `with`.
+Everything else is a parse error, which is the correct failure mode — it triggers the verbatim
+fallback before any execution occurs.
 
 Excluded, and why each one must be:
 
@@ -164,10 +164,12 @@ Excluded, and why each one must be:
 |---|---|
 | `macro`, `call` | Recursive macro → Go stack overflow → **fatal, unrecoverable by `recover()`**; the process dies |
 | `filter` block, `set` block (`{% set x %}…{% endset %}`) | Swap `sub.Output` for a `strings.Builder`/`bytes.Buffer`, bypassing the counting writer entirely |
-| `include`, `extends`, `import`, `from` | Read any partial by name, statically or via a client-controlled variable; also unbounded recursion |
+| `include`, `extends`, `import`, `from`, `block` | Read any partial by name, statically or via a client-controlled variable; also unbounded recursion |
 
-Note that `set` is split: the assignment form is safe, the block form is one of the four
-output-cap bypasses. Whitelisting `set` wholesale would leave that hole open.
+`set` is excluded in **both** forms. Only the block form is dangerous, but both are produced by
+a single `setParser` and the field distinguishing them (`cs.body`) is unexported, so the safe
+assignment form cannot be admitted on its own without vendoring the parser. End-user text has
+no need for `{% set %}`, so exclusion is the cheaper trade.
 
 The untrusted loader contains the message source **and nothing else** — no partials, no
 sibling messages. Self-inclusion is impossible because the include family is not in the
@@ -188,16 +190,24 @@ the working directory. A lint rule and a unit test enforce its absence.
 | `max_output_bytes` | 1 MiB per **request** | Counting `io.Writer`; see caveat below |
 | `max_template_bytes` | 256 KiB | Checked before parse |
 | `max_include_depth` | 8 | Counter inside the replacement `include`/`extends`/`import`, authored environment only |
-| `max_total_iterations` | 100 000 per request | Budget decremented inside the `for` control structure |
+| `max_loop_depth` | 2 | Post-parse AST walk over `*ForControlStructure`; also rejects `{% for … recursive %}` |
+| `max_iterable_len` | 1 000 | Variable map validated before render |
 | `render_timeout` | 250 ms | Render runs in a goroutine; caller abandons on timeout |
 
 `max_output_bytes` is a **per-request** budget shared across all messages, not per-message;
 otherwise N messages multiply it.
 
-`max_total_iterations` replaces the earlier `max_range_size`. Capping the `range` global was
-theatre: nested loops multiply (three 10-iteration loops = 1000 iterations, zero output), and
-`{% for %}` iterates client-supplied arrays from the body `variables` field, which a `range`
-cap does not touch at all. Only a global step budget checked inside the loop is sound.
+Loop depth and iterable length together replace the earlier `max_range_size`. Capping the
+`range` global was theatre: nested loops multiply (three 10-iteration loops = 1000 iterations,
+zero output), and `{% for %}` iterates client-supplied arrays from the body `variables` field,
+which a `range` cap does not touch at all. Bounding both factors caps total iterations at
+`max_iterable_len ^ max_loop_depth` — 10⁶ at the defaults.
+
+A runtime step counter inside the loop would be tighter, but `forParser` is unexported in
+`builtins/control_structures` and cannot be wrapped without vendoring it. The depth-plus-length
+pair achieves a sound bound using only exported API. `range` is dropped regardless: the
+untrusted environment is built with an empty global context, which removes `range`, `lipsum`,
+and `cycler`.
 
 **Known limitation, stated deliberately:** `Execute` accepts no `context.Context`, so a
 deadline cannot interrupt a render already in flight, and the timeout abandons the goroutine
