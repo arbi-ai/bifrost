@@ -5676,13 +5676,6 @@
               },
               "description": "Azure scopes for authentication"
             },
-            "deployments": {
-              "type": "object",
-              "additionalProperties": {
-                "type": "string"
-              },
-              "description": "Model to deployment mappings"
-            },
             "api_version": {
               "type": "string",
               "description": "Azure API version"
@@ -5719,13 +5712,6 @@
               "type": "boolean",
               "description": "When true, always call the configured region and skip automatic promotion of multi-region-only models to a multi-region endpoint. Enable for provisioned throughput.",
               "default": false
-            },
-            "deployments": {
-              "type": "object",
-              "additionalProperties": {
-                "type": "string"
-              },
-              "description": "Model to deployment mappings"
             }
           },
           "required": ["project_id", "region"],
@@ -6740,13 +6726,6 @@
                     },
                     "description": "Azure scopes for authentication"
                   },
-                  "deployments": {
-                    "type": "object",
-                    "additionalProperties": {
-                      "type": "string"
-                    },
-                    "description": "Model to deployment mappings"
-                  },
                   "api_version": {
                     "type": "string",
                     "description": "Azure API version"
@@ -6782,13 +6761,6 @@
                     "type": "boolean",
                     "description": "When true, always call the configured region and skip automatic promotion of multi-region-only models to a multi-region endpoint. Enable for provisioned throughput.",
                     "default": false
-                  },
-                  "deployments": {
-                    "type": "object",
-                    "additionalProperties": {
-                      "type": "string"
-                    },
-                    "description": "Model to deployment mappings"
                   }
                 },
                 "additionalProperties": false
