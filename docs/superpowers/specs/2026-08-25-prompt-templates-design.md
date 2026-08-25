@@ -154,9 +154,18 @@ references cannot bound it. The depth guard must live inside the control structu
 
 ### Untrusted environment — client-sent messages
 
-Built with `exec.NewControlStructureSet` containing only: `if`, `for`, `raw`, and `with`.
-Everything else is a parse error, which is the correct failure mode — it triggers the verbatim
-fallback before any execution occurs.
+Built with `exec.NewControlStructureSet` containing only: `if`, `for`, and `raw`. Everything
+else is a parse error, which triggers the verbatim fallback before any execution occurs.
+
+`with` is excluded despite being harmless in itself: `WithControlStructure`'s fields are all
+unexported (`location`, `pairs`, `wrapper`), so the loop-depth guard cannot descend into its
+body and a loop nest hidden inside `{% with %}` would go uncounted. It buys only
+`{% with y = 1 %}`, which end-user text does not need.
+
+**Parse-time rejection is necessary but not sufficient.** Two attack classes never reach the
+control-structure layer at all, and both are covered below: the parser itself is
+attacker-reachable (see "Pre-parse guards"), and the expression layer can exhaust memory
+inside a single `{{ … }}` with no control structure present (see "Filter allowlist").
 
 Excluded, and why each one must be:
 
@@ -183,6 +192,54 @@ reflection, so any handle placed in the context exposes its entire method set.
 `gonja.FromString` is banned in both environments — it attaches a filesystem loader rooted at
 the working directory. A lint rule and a unit test enforce its absence.
 
+### Pre-parse guards
+
+**The parser is attacker-reachable and is not recursion-safe.** `{{ ((((…1…)))) }}` at 60 000
+nesting levels is 120 007 bytes — comfortably under `max_template_bytes` — and causes a fatal
+Go stack overflow inside `parser.(*Parser).parseOr`. `[[[[…]]]]` behaves identically. This is
+the same unrecoverable class as the recursive macro: `recover()` does not catch it, the process
+exits, and it takes every in-flight request with it.
+
+Nothing in the control-structure design touches this. It uses no control structures, so the
+restricted set never sees it, and it happens inside `exec.NewTemplate`, so the AST guard — which
+runs on the parse tree — never sees it either. The verbatim fallback cannot catch it because
+there is no error to return.
+
+Therefore, **before** `exec.NewTemplate` is called on untrusted input, a scan over the raw
+source rejects:
+
+| Guard | Default | Rationale |
+|---|---|---|
+| `max_expression_depth` | 64 | Maximum unmatched `(`, `[`, `{` nesting depth |
+| `max_template_bytes` | 64 KiB | Lowered from 256 KiB; defence in depth, not the primary control |
+
+The depth scan is a single pass over the bytes with three counters — cheap enough for the path
+that runs on every request. It must not be replaced by a size limit alone: `(` and `[` are both
+two bytes per nesting level, and no audit has been done for a denser one-byte-per-level shape,
+so a byte cap is a guess about template shape rather than a bound on parser recursion.
+
+### Filter allowlist
+
+The untrusted environment carries a **restricted filter set**, built by the same subtract-from-
+builtins mechanism as the control structures. Without it, a 27-byte template with no control
+structure allocates a gigabyte:
+
+```
+{{ s | center(200000000) }}   →  1091 MB allocated
+{{ s * 100000000 }}           →   286 MB allocated
+```
+
+The value is materialised in memory and only then handed to the budgeted writer, so the output
+cap, the loop guard, and the iterable cap are all bypassed simultaneously.
+
+Excluded from the untrusted filter set: every filter taking a size or count argument that
+allocates proportionally to it — `center`, `indent`, `wordwrap`, `truncate`, `format`,
+`filesizeformat`, `batch`, `slice`, `list`. The `*` operator is clamped for both `string * int`
+and `list * int`.
+
+The authored environment keeps the full builtin filter set; org-written templates are trusted
+input.
+
 ## Resource limits
 
 | Limit | Default | Mechanism |
@@ -190,8 +247,9 @@ the working directory. A lint rule and a unit test enforce its absence.
 | `max_output_bytes` | 1 MiB per **request** | Counting `io.Writer`; see caveat below |
 | `max_template_bytes` | 256 KiB | Checked before parse |
 | `max_include_depth` | 8 | Counter inside the replacement `include`/`extends`/`import`, authored environment only |
-| `max_loop_depth` | 2 | Post-parse AST walk over `*ForControlStructure`; also rejects `{% for … recursive %}` |
-| `max_iterable_len` | 1 000 | Variable map validated before render |
+| `max_expression_depth` | 64 | Pre-parse byte scan; guards parser recursion |
+| `max_loop_depth` | 2 | Post-parse AST walk, **fail-closed type switch**; also rejects `{% for … recursive %}` |
+| `max_iterable_len` | 1 000 | Variable map validated before render; **strings count by length** |
 | `render_timeout` | 250 ms | Render runs in a goroutine; caller abandons on timeout |
 
 `max_output_bytes` is a **per-request** budget shared across all messages, not per-message;
@@ -208,6 +266,20 @@ A runtime step counter inside the loop would be tighter, but `forParser` is unex
 pair achieves a sound bound using only exported API. `range` is dropped regardless: the
 untrusted environment is built with an empty global context, which removes `range`, `lipsum`,
 and `cycler`.
+
+Two properties the bound depends on, both of which were wrong in an earlier revision:
+
+- **The AST walk must fail closed.** A reflective walk over exported fields silently
+  under-counts: `IfControlStructure` holds its branches in `Wrappers []*nodes.Wrapper` and
+  `WithControlStructure` holds everything in unexported fields, so a three-deep loop nest
+  inside `{% if %}` or `{% with %}` was counted as depth zero and executed, allocating 25 GB.
+  The walk is an explicit type switch over the allowed control structures that **returns an
+  error on any unrecognised node type**, so an unwalkable node is rejected rather than waved
+  through. `with` is dropped from the allowed set for exactly this reason.
+- **Strings are iterable.** `{% for c in big %}` over a 200 KB string variable runs 200 000
+  times and allocates 345 MB, at loop depth 1 — inside the depth limit, needing no bypass.
+  `max_template_bytes` does not bound it, since that governs the template, not the variable
+  map. String length therefore counts toward `max_iterable_len`.
 
 **Known limitation, stated deliberately:** `Execute` accepts no `context.Context`, so a
 deadline cannot interrupt a render already in flight, and the timeout abandons the goroutine
@@ -230,7 +302,12 @@ no filesystem access, and none is stopped by the earlier single-environment desi
 | `{% include client_supplied_var %}` | Reads any partial by name; cross-tenant if the registry is global | include family excluded from untrusted set |
 | `{{ hidden_default }}` | Prints an org-authored version default the caller never sent | Untrusted env sees an allowlist, not the merged map |
 | `{{ some_handle.Dump() }}` | gonja calls exported Go methods by reflection | Never place handles in the context |
-| Nested `{% for %}` over a 20 000-element client array | 4×10⁸ iterations, zero output | `max_total_iterations` |
+| Nested `{% for %}` over a 20 000-element client array | 4×10⁸ iterations, zero output | `max_iterable_len` + `max_loop_depth` |
+| `{{ ((((…1…)))) }}` at 60 000 depth, 120 KB | **Fatal stack overflow in the parser; process exits**, `recover()` cannot catch it | `max_expression_depth`, checked before parse |
+| `{{ s \| center(200000000) }}` — 27 bytes, no control structures | 1091 MB allocated before the writer sees a byte | Filter allowlist |
+| `{{ s * 100000000 }}` | 286 MB allocated | `*` operator clamped |
+| 3-deep loop nest inside `{% if %}` or `{% with %}` | 25 GB; the reflective walker counted it as depth 0 | Fail-closed type-switch walk; `with` dropped |
+| `{% for c in big %}` over a 200 KB string variable | 345 MB at loop depth 1 | String length counts toward `max_iterable_len` |
 
 Variable *values* are not re-parsed as templates, so there is no second-order injection through
 `variables` — a value containing `{% include %}` renders literally. That property is relied
@@ -446,11 +523,17 @@ asserting a *parse* error in the untrusted environment rather than a caught runt
 
 - Recursive `macro`, `call`, `filter` block, `set` block, and every member of the include
   family are rejected at parse.
-- `if` / `for` / `raw` / `with` / assignment-`set` still parse and render, so the restriction
+- `if` (with `else`/`elif`), `for` (with `else` and the `for … if` form), `loop.index`, `raw`,
+  nested attribute access, and the permitted filters still parse and render, so the restriction
   costs no stated expressiveness.
+- A three-deep loop nest is rejected whether it is bare or hidden inside `{% if %}`, `{% else %}`,
+  or `{% elif %}`; an unrecognised node type is rejected rather than walked past.
+- Deeply nested `(`/`[` expressions are rejected before parse; the process survives.
+- Sizing filters and `*` with a large operand are rejected or clamped.
+- Iterating a long string trips `max_iterable_len`.
 - A client message cannot read a version default or a partial.
 - A variable *value* containing template syntax renders literally (no second-order injection).
-- Nested loops over a large client-supplied array trip `max_total_iterations`.
+- Nested loops over a large client-supplied array trip `max_iterable_len` or `max_loop_depth`.
 
 The macro case cannot be tested in-process, since the failure it guards against is a fatal
 stack overflow that `recover()` does not catch. Assert the parse rejection; if a subprocess
@@ -468,7 +551,8 @@ assert a non-zero exit.
 | Render latency on stored templates | Compiled-template cache keyed by **resolved** version number + a fingerprint of the partial set (see below) |
 | Render latency on client messages | Unmitigated and unmitigatable by caching — client message templates are arbitrary strings. This is the path running on 100% of requests, so the restricted parser must be cheap; benchmark it |
 | Upstream rebase pain | Fork diff held to six files; all logic lives in the standalone module |
-| Goroutine leak from a runaway render | Output cap and capped `range` are the real controls; timeout is a backstop. Monitored, not relied upon |
+| Goroutine leak from a runaway render | Pre-parse depth scan, restricted control-structure and filter sets, and the fail-closed AST walk are the real controls; the output cap and timeout are backstops that several verified attacks bypass. Monitored, not relied upon |
+| A future gonja upgrade reintroducing a bypass | The attack table is a regression suite, not prose; every row is a test. Pin the gonja version and re-run it on every bump |
 
 ## Milestones
 
