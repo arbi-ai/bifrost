@@ -1230,6 +1230,212 @@ git commit -m "feat(engine): drop sizing filters from the untrusted environment"
 
 ---
 
+### Task 5d: Structural expression guards
+
+Cost is not visible in bytes, so these guards must run on the parse tree. Two verified attacks live here, and neither the byte scan nor the loop guard can reach either.
+
+**Files:**
+- Create: `engine/exprguard.go`
+- Test: `engine/exprguard_test.go`
+
+**Interfaces:**
+- Consumes: Task 2's environment.
+- Produces:
+  - `func GuardExpressionNodes(root *nodes.Template, maxFilterChain int) error`
+  - `var ErrOperatorNotPermitted`, `var ErrFilterChainTooLong`
+
+**Do not use `nodes.Walk` or `nodes.Inspect`.** They look like exactly the right tool and are not: `nodes/walk.go` handles only `*Template` and `*Wrapper` and returns `Unkown type %T` for everything else — the remaining cases are commented out in the source. Walk your own tree.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `engine/exprguard_test.go`:
+
+```go
+package engine_test
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/arbi-ai/bifrost-prompt-templates/engine"
+	"github.com/stretchr/testify/require"
+)
+
+// {{ "abcdefghij" * 200000000 }} is 30 bytes and allocates 3815MB. The
+// multiplier need not be a literal -- {{ s * n }} with n from variables is 22
+// bytes and allocates 9537MB -- so capping numeric literals in the byte scan
+// closes only one of two doors. gonja exposes no way to intercept operators
+// (they are a hardcoded switch in the unexported evalBinaryExpression), so the
+// operator must be rejected structurally.
+func TestGuardRejectsMultiplication(t *testing.T) {
+	for _, src := range []string{
+		`{{ "abcdefghij" * 200000000 }}`,
+		`{{ s * n }}`,
+		`{% if a %}{{ s * 1000 }}{% endif %}`,
+	} {
+		tpl := parseTreeForGuard(t, src)
+		require.ErrorIs(t, engine.GuardExpressionNodes(tpl.Root(), 4), engine.ErrOperatorNotPermitted, src)
+	}
+}
+
+func TestGuardAllowsOrdinaryOperators(t *testing.T) {
+	for _, src := range []string{
+		`{{ a + b }}`, `{{ a ~ b }}`, `{{ a == b }}`, `{{ a and b }}`,
+	} {
+		tpl := parseTreeForGuard(t, src)
+		require.NoError(t, engine.GuardExpressionNodes(tpl.Root(), 4), src)
+	}
+}
+
+// Each |tojson doubles its input: 24 filters is 175 bytes and produces 33MB;
+// 34 filters fits inside MaxExpressionBytes=256 and yields ~34GB. The value is
+// materialised before the budgeted writer sees it, so the output cap is blind.
+func TestGuardRejectsLongFilterChains(t *testing.T) {
+	src := "{{ s" + strings.Repeat("|tojson", 24) + " }}"
+	tpl := parseTreeForGuard(t, src)
+	require.ErrorIs(t, engine.GuardExpressionNodes(tpl.Root(), 4), engine.ErrFilterChainTooLong)
+}
+
+func TestGuardAllowsRealisticFilterChains(t *testing.T) {
+	tpl := parseTreeForGuard(t, `{{ name | trim | lower | default('anon') }}`)
+	require.NoError(t, engine.GuardExpressionNodes(tpl.Root(), 4))
+}
+```
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Run: `go test ./engine/ -run "TestGuardRejectsMultiplication|TestGuardRejectsLongFilterChains" -v`
+Expected: FAIL — `undefined: engine.GuardExpressionNodes`.
+
+- [ ] **Step 3: Implement**
+
+Create `engine/exprguard.go`:
+
+```go
+package engine
+
+import (
+	"errors"
+
+	controlStructures "github.com/nikolalohinski/gonja/v2/builtins/control_structures"
+	"github.com/nikolalohinski/gonja/v2/nodes"
+)
+
+var (
+	// ErrOperatorNotPermitted reports an operator whose cost is unbounded by the
+	// size of the expression containing it.
+	ErrOperatorNotPermitted = errors.New("operator is not permitted in untrusted templates")
+
+	// ErrFilterChainTooLong reports a filter chain long enough to expand its
+	// input exponentially.
+	ErrFilterChainTooLong = errors.New("filter chain is too long")
+)
+
+// GuardExpressionNodes walks expressions and rejects constructs whose cost is
+// not bounded by their source length.
+//
+// This exists because a pre-parse byte scan can only bound what is visible in
+// bytes, and cost is not: {{ s * n }} is 11 bytes and allocates 9.5 GB, while
+// a 175-byte |tojson chain produces 33 MB and a 247-byte one produces ~34 GB.
+func GuardExpressionNodes(root *nodes.Template, maxFilterChain int) error {
+	if root == nil {
+		return nil
+	}
+	return guardStmts(root.Nodes, maxFilterChain)
+}
+
+func guardStmts(ns []nodes.Node, maxFilterChain int) error {
+	for _, n := range ns {
+		if err := guardStmt(n, maxFilterChain); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func guardWrapper(w *nodes.Wrapper, maxFilterChain int) error {
+	if w == nil {
+		return nil
+	}
+	return guardStmts(w.Nodes, maxFilterChain)
+}
+
+func guardStmt(n nodes.Node, maxFilterChain int) error {
+	switch typed := n.(type) {
+	case *nodes.ControlStructureBlock:
+		return guardStmt(typed.ControlStructure, maxFilterChain)
+	case *nodes.Output:
+		for _, e := range []nodes.Expression{typed.Expression, typed.Condition, typed.Alternative} {
+			if err := guardExpr(e, maxFilterChain); err != nil {
+				return err
+			}
+		}
+	case *controlStructures.ForControlStructure:
+		if err := guardExpr(typed.ObjectEvaluator, maxFilterChain); err != nil {
+			return err
+		}
+		if err := guardExpr(typed.IfCondition, maxFilterChain); err != nil {
+			return err
+		}
+		if err := guardWrapper(typed.BodyWrapper, maxFilterChain); err != nil {
+			return err
+		}
+		return guardWrapper(typed.EmptyWrapper, maxFilterChain)
+	case *controlStructures.IfControlStructure:
+		for _, c := range typed.Conditions {
+			if err := guardExpr(c, maxFilterChain); err != nil {
+				return err
+			}
+		}
+		for _, w := range typed.Wrappers {
+			if err := guardWrapper(w, maxFilterChain); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func guardExpr(e nodes.Expression, maxFilterChain int) error {
+	switch typed := e.(type) {
+	case nil:
+		return nil
+	case *nodes.BinaryExpression:
+		// String and list repetition: cost is the operand VALUE, not the
+		// expression length. gonja offers no operator hook, so reject here.
+		if typed.Operator != nil && typed.Operator.Token != nil && typed.Operator.Token.Val == "*" {
+			return ErrOperatorNotPermitted
+		}
+		if err := guardExpr(typed.Left, maxFilterChain); err != nil {
+			return err
+		}
+		return guardExpr(typed.Right, maxFilterChain)
+	case *nodes.FilteredExpression:
+		if len(typed.Filters) > maxFilterChain {
+			return ErrFilterChainTooLong
+		}
+		return guardExpr(typed.Expression, maxFilterChain)
+	}
+	return nil
+}
+```
+
+**Implementer note:** `guardExpr` returns nil for expression types it does not recognise, unlike `GuardLoops` which fails closed. That is deliberate — the expression grammar is large and failing closed on it would reject ordinary templates — but it means this guard bounds only the two verified classes. If a third expensive expression shape is found, it is added here.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `go test ./engine/ -v`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add engine/exprguard.go engine/exprguard_test.go
+git commit -m "feat(engine): reject unbounded operators and long filter chains"
+```
+
+---
+
 ### Task 6: The untrusted renderer
 
 Assembles Tasks 2–5 into the render-or-return-verbatim path that runs on every client message.
@@ -1377,6 +1583,7 @@ package engine
 
 import (
 	"bytes"
+	"fmt"
 
 	"github.com/nikolalohinski/gonja/v2/builtins"
 	"github.com/nikolalohinski/gonja/v2/config"
@@ -1397,6 +1604,7 @@ type Limits struct {
 	MaxLoopDepth       int
 	MaxIterableLen     int
 	MaxStringLen       int
+	MaxFilterChain     int
 }
 
 func DefaultLimits() Limits {
@@ -1419,6 +1627,10 @@ func DefaultLimits() Limits {
 		MaxIterableLen: 1000,
 		// Generous: a pasted document is a legitimate variable value.
 		MaxStringLen: 10000,
+		// Each |tojson roughly DOUBLES its input, so a chain is exponential in
+		// its length regardless of how few bytes it occupies. Realistic prompt
+		// expressions use at most three filters.
+		MaxFilterChain: 4,
 	}
 }
 
@@ -1508,6 +1720,34 @@ func (u *Untrusted) Render(src string, vars map[string]any, allowed []string, bu
 	if err := GuardLoops(tpl.Root(), u.limits.MaxLoopDepth); err != nil {
 		return src, Outcome{Err: err}
 	}
+
+	// Structural guards on expressions. These CANNOT be done in the pre-parse
+	// byte scan: cost is not visible in bytes.
+	if err := GuardExpressionNodes(tpl.Root(), u.limits.MaxFilterChain); err != nil {
+		return src, Outcome{Err: err}
+	}
+
+	return u.execute(tpl, scoped, src, budget)
+}
+
+// execute runs the template with a panic barrier.
+//
+// gonja panics on some hostile input rather than returning an error: a 37-byte
+// {{ "abcdefghij" * 9999999999999999 }} reaches strings.Repeat, which panics
+// with "makeslice: len out of range". An unrecovered panic in any goroutine
+// takes down the whole process.
+//
+// Unlike the parser's stack overflow, this IS recoverable, and recovering it
+// converts an entire open-ended class -- "some gonja path panics on input we
+// did not foresee" -- into an ordinary verbatim fallback. No amount of
+// pre-parse guarding can enumerate that class, so this barrier is mandatory
+// and stays even as specific guards are added.
+func (u *Untrusted) execute(tpl *exec.Template, scoped map[string]any, src string, budget *Budget) (out string, oc Outcome) {
+	defer func() {
+		if r := recover(); r != nil {
+			out, oc = src, Outcome{Err: fmt.Errorf("render panicked: %v", r)}
+		}
+	}()
 
 	var buf bytes.Buffer
 	if err := tpl.Execute(budget.Writer(&buf), exec.NewContext(scoped)); err != nil {

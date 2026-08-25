@@ -159,7 +159,7 @@ capability, not safety:
 |---|---|---|
 | `include` / `extends` / `import`, `macro`, `set`, `with` | ✗ | ✓ |
 | Full filter and method sets | ✗ | ✓ |
-| Nested loops | ✗ (depth 1) | ✓ (depth 4) |
+| Nested loops | ✗ (depth 1) | ✓ (depth 4, see caveat) |
 | Expression size and bracket-depth guards | ✓ | ✓ |
 | Iterable and string length caps | ✓ | ✓ |
 | Output budget | ✓ | ✓ |
@@ -167,6 +167,31 @@ capability, not safety:
 
 Loader contains the resolved partial set plus the template source under a per-render random
 key. `StrictUndefined = true`.
+
+**The authored loop bound is not a safety property.** Depth 4 × `max_iterable_len` 1 000 is
+10¹², and 10¹⁶ once strings are counted. That is an OOM with extra steps, not a limit. The only
+honest controls for the authored environment are a runtime step counter or a wall-clock
+deadline; the depth×length product is arithmetic and must not be presented as a guarantee.
+Plan 2 owns this.
+
+**Authored templates get a larger `max_expression_bytes`** (1–2 KiB rather than 256). A
+realistic system-prompt line built from `~` concatenations already measures 207 bytes — 81% of
+the untrusted budget. For untrusted text an over-rejection is a harmless verbatim fallback; for
+an authored template it is a hard 400 on something that used to work. Validate against real
+Portkey templates before shipping.
+
+**`GuardLoops` must not be reused as-is for the authored environment.** It knows only
+`For`/`If`/`Raw`/`ControlStructureBlock` and fails closed, so all eleven other control
+structures — `macro`, `include`, `extends`, `import`, `with`, `set`, `block`, `call`, `filter`,
+`do`, `autoescape` — would be rejected, breaking authored rendering entirely. Plan 2 needs a
+separate `AuthoredGuardLoops` with a case per structure. `with` genuinely cannot be walked (all
+fields unexported), so either vendor it or accept that loop nests inside `{% with %}` are
+uncounted in authored templates, and record which.
+
+A macro-recursion depth counter **is** implementable with exported API: `MacroControlStructure`
+embeds the exported `*nodes.Macro`, and `exec.MacroNodeToFunc` returns the exported
+`exec.Macro` func type, so the parser can be wrapped and the returned macro decorated with a
+per-render depth counter before it reaches the context.
 
 **Partials are tenant-scoped.** `prompt_partials` carries a tenant column and the loader is
 built per tenant, so `{% include %}` cannot reach another tenant's content. Neither the
@@ -262,8 +287,49 @@ cap, the loop guard, and the iterable cap are all bypassed simultaneously.
 
 Excluded from the untrusted filter set: every filter taking a size or count argument that
 allocates proportionally to it — `center`, `indent`, `wordwrap`, `truncate`, `format`,
-`filesizeformat`, `batch`, `slice`, `list`. The `*` operator is clamped for both `string * int`
-and `list * int`.
+`filesizeformat`, `batch`, `slice`, `list`.
+
+Two things the filter allowlist does **not** cover, both handled structurally on the parse tree
+instead (see "Structural expression guards"):
+
+- **String methods.** `{{ s.zfill(200000000) }}` reaches the same sizing operation through
+  different syntax and allocates 572 MB. The method sets are unexported and cannot be
+  subtracted, so the untrusted environment gets no methods at all.
+- **The `*` operator.** gonja exposes exactly five pluggable sets — `Filters`,
+  `ControlStructures`, `Tests`, `Context`, `Methods`. Operators are a hardcoded `switch` in the
+  unexported `(*Evaluator).evalBinaryExpression`, so **there is no way to intercept or clamp
+  them.** An earlier revision of this spec claimed `*` was clamped; that was not implementable
+  and the claim was wrong.
+
+### Structural expression guards
+
+A pre-parse byte scan bounds only what is visible in bytes, and cost is not. Two verified
+attacks are cheap in bytes and enormous in cost, so both are rejected on the parse tree:
+
+- **`*` repetition** — `{{ s * n }}` is 11 bytes and allocates 9.5 GB. Capping numeric
+  *literals* is insufficient: the multiplier can come from `variables`, which `CheckIterables`
+  never inspects because it bounds only strings, slices and maps. The operator is therefore
+  rejected wholesale for untrusted text.
+- **Filter-chain arity** — each `|tojson` roughly doubles its input, so a chain is exponential
+  in its length however few bytes it occupies: 24 filters is 175 bytes and yields 33 MB;
+  34 filters fits inside `max_expression_bytes` and yields ~34 GB. `max_filter_chain` is 4;
+  realistic prompt expressions use at most three.
+
+`escape` survives chaining only because it returns early when its input is already marked safe
+— idempotence in that one filter, not a property of the allowlist. Adding a filter now requires
+checking that its **output** is bounded by its input, not merely its cost.
+
+### The panic barrier
+
+`Render` wraps execution in `defer recover()`. gonja panics rather than erroring on some
+hostile input: a 37-byte `{{ "abcdefghij" * 9999999999999999 }}` reaches `strings.Repeat`,
+which panics with `makeslice: len out of range`, and an unrecovered panic in any goroutine
+takes down the process.
+
+Unlike the parser's stack overflow this is recoverable, and recovering it converts an
+open-ended class — "some gonja path panics on input nobody foresaw" — into an ordinary verbatim
+fallback. No enumeration of specific guards can close that class. The barrier stays permanently,
+independent of any individual guard.
 
 The authored environment keeps the full builtin filter set; org-written templates are trusted
 input.
@@ -336,6 +402,9 @@ no filesystem access, and none is stopped by the earlier single-environment desi
 | `{{ s \| center(200000000) }}` — 27 bytes, no control structures | 1091 MB allocated before the writer sees a byte | Filter allowlist |
 | `{{ s.zfill(200000000) }}` | 572 MB; same sizing operation reached via a string *method*, bypassing the filter allowlist | No methods in the untrusted environment |
 | `{{ a.b.b.b… }}` — 4 KB, no brackets, no loops, no variables | 2792 MB, O(n³); passed the bracket-depth guard, the size cap, the loop guard and the iterable cap, emitting zero output | `max_expression_bytes` |
+| `{{ s * n }}` — 11 bytes, multiplier from `variables` | 9.5 GB; no operator hook exists in gonja | `*` rejected on the parse tree |
+| `{{ s\|tojson\|tojson… }}` ×34 — 247 bytes, inside `max_expression_bytes` | ~34 GB; each filter doubles its input | `max_filter_chain` = 4 |
+| `{{ "abcdefghij" * 9999999999999999 }}` — 37 bytes | `panic: makeslice: len out of range`; **process exits** | `defer recover()` in `Render` |
 | `{{ s * 100000000 }}` | 286 MB allocated | `*` operator clamped |
 | 3-deep loop nest inside `{% if %}` or `{% with %}` | 25 GB; the reflective walker counted it as depth 0 | Fail-closed type-switch walk; `with` dropped |
 | `{% for c in big %}` over a 200 KB string variable | 345 MB at loop depth 1 | String length counts toward `max_iterable_len` |
