@@ -1,7 +1,11 @@
 # Prompt Templates Plugin — Design
 
 **Date:** 2026-08-25
-**Status:** Approved for planning
+**Status:** Revised after adversarial review — awaiting re-approval
+**Revision:** The single-environment sandbox was replaced with two isolated render
+environments after review found three process-level DoS vectors and a data-exfiltration
+primitive reachable from an ordinary chat message. See "Two render environments" and
+"Attacks this design must stop".
 **Repos:** `arbi-ai/bifrost-prompt-templates` (new module), `arbi-ai/bifrost` (fork)
 
 ## Summary
@@ -127,30 +131,100 @@ Kept deliberately small so rebasing on upstream `dev` stays cheap:
 | `framework/configstore/tables/promptPartials.go` | new table + migration |
 | `ui/` | partials editor, render preview |
 
-## Sandbox and resource limits
+## Two render environments
 
-Every render constructs its template through `exec.NewTemplate(self, cfg, memLoader, env)`,
-where `memLoader` is a `loaders.NewMemoryLoader` holding the message source under `/__msg__`
-together with the resolved partial set, and nothing else. `gonja.FromString` is banned; a lint
-rule and a unit test enforce its absence. The filesystem is not merely restricted but absent —
-the verification table above shows `/etc/hosts` returning `unknown path`.
+**This is the load-bearing security decision.** Authored content and untrusted content are
+rendered in separate gonja environments with different capabilities. An earlier revision of
+this spec rendered both in one environment and reasoned that blocking filesystem access made
+that safe. That reasoning was wrong: the filesystem was never the interesting attack surface,
+and an adversarial review found three unauthenticated process-level DoS vectors and a data
+exfiltration primitive that involve no filesystem access at all. Evidence is recorded in the
+"Attacks this design must stop" section below.
 
-Limits, all configurable with the defaults shown:
+### Authored environment — stored template messages and partials
+
+Full Jinja2. Loader contains the resolved partial set plus the template source under a
+per-render random key. `StrictUndefined = true`.
+
+`{% include %}`, `{% extends %}`, and `{% import %}` are replaced with custom implementations
+that carry a depth counter in the execution context. gonja's own `include` recurses through
+`exec.NewTemplate` unconditionally with no depth limit (`builtins/control_structures/include.go`),
+and the filename is an arbitrary runtime expression, so a static pre-pass over partial
+references cannot bound it. The depth guard must live inside the control structure.
+
+### Untrusted environment — client-sent messages
+
+Built with `exec.NewControlStructureSet` containing only: `if`, `for`, `raw`, `with`, and the
+**assignment** form of `set`. Everything else is a parse error, which is the correct failure
+mode — it triggers the verbatim fallback before any execution occurs.
+
+Excluded, and why each one must be:
+
+| Excluded | Reason |
+|---|---|
+| `macro`, `call` | Recursive macro → Go stack overflow → **fatal, unrecoverable by `recover()`**; the process dies |
+| `filter` block, `set` block (`{% set x %}…{% endset %}`) | Swap `sub.Output` for a `strings.Builder`/`bytes.Buffer`, bypassing the counting writer entirely |
+| `include`, `extends`, `import`, `from` | Read any partial by name, statically or via a client-controlled variable; also unbounded recursion |
+
+Note that `set` is split: the assignment form is safe, the block form is one of the four
+output-cap bypasses. Whitelisting `set` wholesale would leave that hole open.
+
+The untrusted loader contains the message source **and nothing else** — no partials, no
+sibling messages. Self-inclusion is impossible because the include family is not in the
+control-structure set at all.
+
+Variables in the untrusted environment are an explicit allowlist, never the merged map. Two
+reasons: version-declared defaults are org-authored content the caller never supplied and must
+not be able to read back, and gonja invokes exported Go methods on context values via
+reflection, so any handle placed in the context exposes its entire method set.
+
+`gonja.FromString` is banned in both environments — it attaches a filesystem loader rooted at
+the working directory. A lint rule and a unit test enforce its absence.
+
+## Resource limits
 
 | Limit | Default | Mechanism |
 |---|---|---|
-| `max_output_bytes` | 1 MiB | Counting `io.Writer` passed to `Execute`; aborts synchronously |
+| `max_output_bytes` | 1 MiB per **request** | Counting `io.Writer`; see caveat below |
 | `max_template_bytes` | 256 KiB | Checked before parse |
-| `max_include_depth` | 8 | Tracked during partial resolution |
-| `max_range_size` | 10 000 | Custom `range` global replacing the builtin |
+| `max_include_depth` | 8 | Counter inside the replacement `include`/`extends`/`import`, authored environment only |
+| `max_total_iterations` | 100 000 per request | Budget decremented inside the `for` control structure |
 | `render_timeout` | 250 ms | Render runs in a goroutine; caller abandons on timeout |
 
+`max_output_bytes` is a **per-request** budget shared across all messages, not per-message;
+otherwise N messages multiply it.
+
+`max_total_iterations` replaces the earlier `max_range_size`. Capping the `range` global was
+theatre: nested loops multiply (three 10-iteration loops = 1000 iterations, zero output), and
+`{% for %}` iterates client-supplied arrays from the body `variables` field, which a `range`
+cap does not touch at all. Only a global step budget checked inside the loop is sound.
+
 **Known limitation, stated deliberately:** `Execute` accepts no `context.Context`, so a
-deadline cannot interrupt a render already in flight. The output cap terminates anything that
-emits, and the capped `range` global removes the only unbounded non-emitting loop source. The
-timeout is a backstop that abandons the goroutine rather than killing it; a render that
-escapes both prior controls leaks one goroutine until it completes. Accepted for v1 and
-recorded here so it is not rediscovered as a surprise.
+deadline cannot interrupt a render already in flight, and the timeout abandons the goroutine
+rather than killing it. The output cap is *not* a general backstop — it is bypassed by any
+construct that redirects `sub.Output` into a buffer. Safety therefore rests on the restricted
+control-structure set preventing those constructs from ever parsing, with the iteration budget
+and output cap as secondary controls. This is why the environment split, not the caps, is the
+primary defence.
+
+## Attacks this design must stop
+
+Each verified against gonja v2.9.0. Every one is reachable from an ordinary chat message with
+no filesystem access, and none is stopped by the earlier single-environment design.
+
+| Attack | Effect | Stopped by |
+|---|---|---|
+| `{% macro f(n) %}{{ f(n+1) }}{% endmacro %}{% set _ = f(0) %}` | Go stack overflow; **process exits**, `recover()` cannot catch it | `macro` excluded from untrusted set |
+| `{% filter upper %}…{% endfilter %}` around a large expansion | 3.9 GB allocated under a 1 MiB output cap | `filter` block excluded |
+| `{% include '/__msg__' %}` (self), or mutually recursive partials | Goroutine leak allocating GB/s until OOM | include family excluded; depth counter in authored env |
+| `{% include client_supplied_var %}` | Reads any partial by name; cross-tenant if the registry is global | include family excluded from untrusted set |
+| `{{ hidden_default }}` | Prints an org-authored version default the caller never sent | Untrusted env sees an allowlist, not the merged map |
+| `{{ some_handle.Dump() }}` | gonja calls exported Go methods by reflection | Never place handles in the context |
+| Nested `{% for %}` over a 20 000-element client array | 4×10⁸ iterations, zero output | `max_total_iterations` |
+
+Variable *values* are not re-parsed as templates, so there is no second-order injection through
+`variables` — a value containing `{% include %}` renders literally. That property is relied
+upon and must be covered by a regression test.
 
 ## Undefined-variable semantics
 
@@ -173,6 +247,17 @@ production traffic.
 The asymmetry is the point: the stored template is authored and declared, so silence is wrong;
 client messages are unauthored text, so failing loudly is wrong.
 
+Discarding partial output is deliberate. The renderer writes incrementally, so a message that
+errors mid-render has already emitted bytes; returning that truncated text to the provider
+would be worse than either rendering or not rendering. The fallback returns the original
+message byte for byte.
+
+**Every fallback increments a counter and emits a debug log with the parse or exec error.**
+Silence is the design goal for the *caller*, not for the operator: an attacker probing the
+restricted control-structure set produces nothing but fallbacks, and without metering that
+traffic is invisible. A sustained fallback rate on one virtual key is the signal that someone
+is testing the sandbox.
+
 ## Variable sources and precedence
 
 Shallow merge by top-level key, lowest precedence first:
@@ -184,8 +269,17 @@ Shallow merge by top-level key, lowest precedence first:
 The body wins because it is the most specific and the most expressive (nested objects and
 arrays for `{% for %}`; the header is size-constrained and awkward for documents).
 
-This requires widening `TablePromptVersion.Variables` from keys-only to carry real default
-values. The change is backward compatible: every existing value is `""`.
+`TablePromptVersion.Variables` is widened from `map[string]string` to `map[string]any`. The
+`string` typing cannot hold the arrays and objects that `{% for %}` and nested access require,
+so version-declared defaults could otherwise never carry list values.
+
+**A declared variable whose default is empty is treated as absent, not as a value.** Today
+every row's value is `""` (the column stores declared *names*). A naive merge would place
+every declared name in the map with value `""`, so `StrictUndefined` would never fire and the
+400-with-missing-names behaviour — the entire justification for the strict/lenient asymmetry —
+would silently degrade into rendering empty strings for exactly the case it exists to catch.
+The merge must therefore skip empty defaults rather than treat presence as satisfaction. This
+is a required regression test, not an implementation detail.
 
 ## Rendering scope
 
@@ -209,10 +303,28 @@ never write the leading slash. Resolution is depth-capped per the limits table.
 
 ## HTTP surfaces
 
-**Standard inference routes** — `POST /v1/chat/completions`, `/v1/responses`, and the
-integration equivalents accept a top-level `variables` object alongside `messages`, and the
-`x-bf-prompt-variables` header. Prompt selection continues to use the existing
-`x-bf-prompt-id` / `x-bf-prompt-version` headers.
+**Native inference routes** — `POST /v1/chat/completions` and `/v1/responses` accept a
+top-level `variables` object alongside `messages`, plus the `x-bf-prompt-variables` header.
+Prompt selection continues to use the existing `x-bf-prompt-id` / `x-bf-prompt-version`
+headers.
+
+Three transport details that are easy to get wrong and each need a test:
+
+- **`variables` must be stripped from `ExtraParams`.** `extractExtraParams`
+  (`handlers/inference.go`) sweeps every field absent from `chatParamsKnownFields` /
+  `responsesParamsKnownFields` into `Params.ExtraParams`, and `variables` is in neither list.
+  Left in place, a caller sending `x-bf-passthrough-extra-params: true` gets `variables`
+  merged verbatim into the outgoing provider body and a 400 from upstream. The plugin deletes
+  the key after reading it.
+- **Integration routes (`/openai/*`, etc.) discard `variables` at parse.** `integrations/router.go`
+  uses a plain `sonic.Unmarshal` into the integration's own request type, so an unknown
+  top-level field is dropped before any plugin runs. On those routes the header is the only
+  working transport. This must be documented rather than silently under-delivered.
+- **Large bodies skip the body copy.** `fasthttpToHTTPRequest` (`handlers/middlewares.go`)
+  does not populate `HTTPRequest.Body` above the large-payload threshold, so a plugin reading
+  the raw body in `HTTPTransportPreHook` sees nothing and the variables vanish with no error.
+  Read `variables` from the parsed request in `PreLLMHook` rather than from the raw body, and
+  bound the header path by `ServerConfig.ReadBufferSize`.
 
 **`POST /v1/prompts/{id}/render`** — returns the fully rendered messages and merged params
 without calling a provider, in Portkey's response shape:
@@ -228,7 +340,14 @@ without calling a provider, in Portkey's response shape:
 }
 ```
 
-**Partial CRUD** — REST endpoints under the existing prompt-repo API surface.
+`/render` is registered on the **inference** chain, so virtual-key API clients authenticate
+exactly as they do for completions. This is deliberate: the existing prompt CRUD lives at
+`/api/prompt-repo/*` on the API chain behind dashboard/session auth, and registering `/render`
+there would 401 every API client and break the Portkey-parity use case it exists to serve.
+The two surfaces have different callers and therefore different auth chains.
+
+**Partial CRUD** — REST endpoints at `/api/prompt-repo/partials`, on the API chain alongside
+the existing prompt CRUD, since these are authoring operations.
 
 No dedicated `/v1/prompts/{id}/completions` endpoint. The body-field surface on the standard
 routes covers that capability, and adding a second completion path would duplicate streaming,
@@ -238,19 +357,32 @@ auth, and governance handling for no gain.
 
 Unchanged from the `prompts` plugin: the version's `ModelParams` act as defaults and any
 param present in the request wins. The existing merge logic — including the `ExtraParams`
-reconciliation for keys that are not recognised standard fields — is ported as-is rather than
-rewritten, since it already handles the synthetic-key edge cases.
+reconciliation for keys that are not recognised standard fields — is ported, since it already
+handles the synthetic-key edge cases and the marshal-merge-unmarshal round trip is safe (all
+`ChatParameters` fields are `omitempty` pointers, so request zero-values cannot clobber
+version defaults).
+
+One inherited bug is fixed rather than ported: `applyVersionParamsToChatRequest` guards
+`knownSyntheticChatParamKeys`, but `applyVersionParamsToResponsesRequest` has no equivalent
+guard, so synthetic keys land in `ExtraParams` on the Responses path only. The port applies
+the guard to both.
 
 ## Coexistence with the `prompts` plugin
 
-Both plugins occupy the same ordering slot and both write
-`BifrostContextKeySelectedPromptID`. Running both is unsupported:
+Both plugins write `BifrostContextKeySelectedPromptID`. **Enabling both is a startup error.**
 
-- At init, if `prompts` is also enabled, the new plugin logs a warning naming both.
-- At request time, if `BifrostContextKeySelectedPromptID` is already set, the new plugin skips
-  injection entirely and lets the older plugin's result stand.
+A context-key guard alone does not work. It only holds if `prompts` runs first, and both
+plugins would sit at `builtin` order 2, where `SortAndRebuildPlugins` breaks ties by
+registration order (`lib/config.go`). Register the new plugin first and the guard inverts: it
+sets the key, then `prompts` runs — and `prompts` has no reciprocal guard, since
+`PreLLMHook` (`plugins/prompts/main.go`) never reads that key — so both templates inject and
+the user gets a silently doubled prompt.
 
-This makes a misconfiguration degrade to today's behaviour rather than double-inject.
+Since `prompts` cannot be changed without growing the fork diff, the new plugin refuses to
+initialise when `prompts` is also enabled, naming both in the error. A hard failure at boot is
+correct here: the alternative is a corrupted prompt on every request, discovered in
+production. Note that `prompts` is disabled under enterprise and requires a config store
+(`server/plugins.go`), so the conflict does not arise in every deployment.
 
 ## Degraded `.so` mode
 
@@ -261,6 +393,26 @@ does not: the prompt repository, `/render`, and DB-backed partials.
 
 This must be documented prominently. The two distribution paths have materially different
 capability sets and conflating them will generate support noise.
+
+## Template cache
+
+Stored templates are cached compiled. A shared `*exec.Template` is safe for concurrent
+`Execute` — it builds a fresh `Environment` with `Context.Inherit()` per call, and `{% set %}`
+does not leak across renders — so no per-request compilation or locking is needed.
+
+The key is **resolved version number plus a fingerprint of the partial set**, not the
+requested version plus prompt ID. Two corrections over the obvious key:
+
+- **"Latest" is not a version.** With no `x-bf-prompt-version` header the resolver returns
+  `prompt.LatestVersion`. Keying on the requested version — absent, i.e. 0 — would serve the
+  stale compiled template forever after a new version is published.
+- **Partials are baked into the parse tree and are mutable.** `{% extends %}` and `{% import %}`
+  resolve at parse time, so a cached template pins whatever partial content it was compiled
+  against. Editing a partial through the new CRUD API would otherwise never invalidate it.
+  The fingerprint makes partial edits invalidate the entries that depend on them.
+
+Version immutability makes the first component safe once resolved; it says nothing about the
+second.
 
 ## Testing
 
@@ -273,9 +425,27 @@ Bifrost:
 - Partial resolution, bare-name rewriting, depth capping.
 - Filesystem traversal blocked; `gonja.FromString` absent from the codebase.
 - Strict mode errors and enumerates missing names.
-- Lenient fallback returns the client message byte-identical on both parse and exec errors.
-- Each resource limit trips at its boundary.
-- Precedence: version defaults < header < body.
+- Lenient fallback returns the client message byte-identical on both parse and exec errors,
+  including when the render had already emitted output before failing.
+- Each resource limit trips at its boundary; `max_output_bytes` is per-request, not per-message.
+- Precedence: version defaults < header < body, **and an empty version default counts as
+  absent so strict mode still fires**.
+
+Security regression suite — one test per row of "Attacks this design must stop", each
+asserting a *parse* error in the untrusted environment rather than a caught runtime failure:
+
+- Recursive `macro`, `call`, `filter` block, `set` block, and every member of the include
+  family are rejected at parse.
+- `if` / `for` / `raw` / `with` / assignment-`set` still parse and render, so the restriction
+  costs no stated expressiveness.
+- A client message cannot read a version default or a partial.
+- A variable *value* containing template syntax renders literally (no second-order injection).
+- Nested loops over a large client-supplied array trip `max_total_iterations`.
+
+The macro case cannot be tested in-process, since the failure it guards against is a fatal
+stack overflow that `recover()` does not catch. Assert the parse rejection; if a subprocess
+test of the unrestricted behaviour is wanted as documentation, it must run via `os/exec` and
+assert a non-zero exit.
 
 **Fork** — integration tests through the HTTP transport for the body field, the header, the
 `/render` endpoint, partial CRUD, and coexistence with `prompts` enabled.
@@ -285,13 +455,16 @@ Bifrost:
 | Risk | Mitigation |
 |---|---|
 | `.so` ABI breaks on Go or dependency drift | Pin Go 1.26.6; CI builds the `.so` against the fork's exact module graph |
-| Render latency on the hot path | Compiled-template cache keyed by prompt ID + version; versions are immutable, so entries never need invalidating |
+| Render latency on stored templates | Compiled-template cache keyed by **resolved** version number + a fingerprint of the partial set (see below) |
+| Render latency on client messages | Unmitigated and unmitigatable by caching — client message templates are arbitrary strings. This is the path running on 100% of requests, so the restricted parser must be cheap; benchmark it |
 | Upstream rebase pain | Fork diff held to six files; all logic lives in the standalone module |
 | Goroutine leak from a runaway render | Output cap and capped `range` are the real controls; timeout is a backstop. Monitored, not relied upon |
 
 ## Milestones
 
-1. Engine and sandbox in the standalone module, with the full golden-test suite.
+1. Both render environments and the restricted control-structure set, with the golden-test
+   suite and the security regression suite. The environment split is milestone one because
+   every later milestone depends on which environment its code runs in.
 2. `store/` interfaces, variable precedence, and message rendering.
 3. `Plugin` type, hooks, and in-tree `Init`; wire into the fork's `plugins.go`.
 4. `/render` endpoint and the `prompt_partials` table plus migration.
