@@ -157,7 +157,8 @@ capability, not safety:
 
 | | Untrusted | Authored |
 |---|---|---|
-| `include` / `extends` / `import`, `macro`, `set`, `with` | ✗ | ✓ |
+| `include` / `import` / `from`, `macro`, `call`, `do`, `autoescape`, `trans`, `block` | ✗ | ✓ |
+| `extends`, `with`, `set`, `filter` | ✗ | ✗ — cut, see below |
 | Full filter and method sets | ✗ | ✓ |
 | Nested loops | ✗ (depth 1) | ✓ (depth 4, see caveat) |
 | Expression size and bracket-depth guards | ✓ | ✓ |
@@ -167,6 +168,34 @@ capability, not safety:
 
 Loader contains the resolved partial set plus the template source under a per-render random
 key. `StrictUndefined = true`.
+
+**The authored environment is not full Jinja2.** Four structures are cut, each for a reason
+that cannot be engineered around. Document them as deliberate omissions; authors will notice.
+
+| Cut | Reason |
+|---|---|
+| `extends` | Recursion happens at **parse** time (`extendsParser` → `p.Extend` → recursive parse), and its `Execute` is a no-op with a non-standard signature, so no runtime wrapper can intercept it. `A extends B, B extends A` is a fatal stack overflow. Recoverable only by building literal-graph cycle detection over the partial set — viable, because `extends` filenames are string literals (`args.Match(tokens.String)`), but not free. |
+| `with`, `set`, `filter` | Their node types expose **no** body via exported fields (`wrapper`, `body`, `bodyWrapper` are all unexported), so a loop nest inside them cannot be counted. This is not fixable by adding a walker case. And because `Execute` takes no `context.Context`, the render deadline *abandons* a runaway rather than stopping it — so an uncounted nest is not bounded by anything at all. |
+
+**Two guards are proven implementable and must be built rather than assumed.** Both were
+prototyped against gonja v2.9.0 and caught their target without killing the process:
+
+- **Macro recursion.** Wrap the builtin parser, embed `*MacroControlStructure`, override only
+  `Execute`, and decorate the `exec.Macro` with a depth counter before it reaches the context.
+  Catches direct recursion, mutual recursion (`a`→`b`→`a`), and the emitting variant, while
+  three-level legitimate nesting still renders. **The counter must be allocated inside
+  `Execute`** — per render — never on the wrapper struct, which is per-parse and shared across
+  renders by the cache.
+- **Include/import depth.** Same wrapper trick, with the counter in a pointer box stored in the
+  Context. A pointer is required: `include` passes the same `*Context` into the nested template
+  but `Context.Inherit()` shadows writes, so only mutation through a shared pointer crosses the
+  boundary. Catches self-inclusion, mutual inclusion, and **runtime-expression filenames** —
+  the case a static pre-pass cannot see.
+
+**`AuthoredGuardLoops` needs two extra roots.** `BlockControlStructure` carries no body on the
+node, and macro bodies are likewise not reachable from the statement tree — but
+`nodes.Template.Blocks` (`map[string]*Wrapper`) and `nodes.Template.Macros` are both exported.
+Walking only `root.Nodes` silently skips every block and macro body.
 
 **The authored loop bound is not a safety property.** Depth 4 × `max_iterable_len` 1 000 is
 10¹², and 10¹⁶ once strings are counted. That is an OOM with extra steps, not a limit. The only
@@ -201,9 +230,12 @@ leaving it implied.
 
 `{% include %}`, `{% extends %}`, and `{% import %}` are replaced with custom implementations
 that carry a depth counter in the execution context. gonja's own `include` recurses through
-`exec.NewTemplate` unconditionally with no depth limit (`builtins/control_structures/include.go`),
-and the filename is an arbitrary runtime expression, so a static pre-pass over partial
-references cannot bound it. The depth guard must live inside the control structure.
+`exec.NewTemplate` unconditionally with no depth limit (`builtins/control_structures/include.go`).
+For `include` and `import` the filename is an arbitrary runtime expression, so a static pre-pass
+over partial references cannot bound them and the depth guard must live inside the control
+structure. `extends` is the exception — its filename is a string literal only, so it *is*
+statically analysable, which matters because it is the one structure a runtime wrapper cannot
+reach.
 
 ### Untrusted environment — client-sent messages
 
@@ -599,8 +631,16 @@ Stored templates are cached compiled. A shared `*exec.Template` is safe for conc
 `Execute` — it builds a fresh `Environment` with `Context.Inherit()` per call, and `{% set %}`
 does not leak across renders — so no per-request compilation or locking is needed.
 
-The key is **resolved version number plus a fingerprint of the partial set**, not the
-requested version plus prompt ID. Two corrections over the obvious key:
+The key is **tenant ID plus resolved version number plus a content fingerprint of the partial
+set**. Three corrections over the obvious key:
+
+- **Omitting the tenant ID is a cross-tenant data leak, and it fails open.** `exec.NewTemplate`
+  stores the loader on the Template (`exec/template.go:43`) and `Execute` renders with that
+  compile-time `t.loader` (`:71`) — so a per-tenant loader built at request time is **silently
+  ignored on a cache hit**. Verified: tenant B receives tenant A's partial content, with no
+  error raised. The tenant column on `prompt_partials` and the per-tenant loader are both
+  nullified by the cache unless the key carries the tenant. Fingerprinting partial *names*
+  rather than content collides even faster.
 
 - **"Latest" is not a version.** With no `x-bf-prompt-version` header the resolver returns
   `prompt.LatestVersion`. Keying on the requested version — absent, i.e. 0 — would serve the
