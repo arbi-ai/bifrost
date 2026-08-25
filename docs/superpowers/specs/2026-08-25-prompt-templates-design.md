@@ -143,8 +143,36 @@ exfiltration primitive that involve no filesystem access at all. Evidence is rec
 
 ### Authored environment — stored template messages and partials
 
-Full Jinja2. Loader contains the resolved partial set plus the template source under a
-per-render random key. `StrictUndefined = true`.
+**"Authored" is a statement about intent, not about privilege.** In a multi-tenant gateway,
+prompt authors are customers, not operators, and a customer-authored template running on a
+shared process is untrusted input wearing a different label. An earlier revision gave this
+environment unrestricted Jinja2 on the assumption that authorship implies trust. That
+assumption is wrong for the fork's deployment model, and it left a prompt author able to kill
+the shared process with the recursive macro proven fatal above, OOM it with `center(2e8)` or a
+long attribute chain, and read other tenants' partials.
+
+The authored environment therefore gets full Jinja2 **expressiveness** but the same
+**resource** guards as the untrusted one. The distinction between the two environments is
+capability, not safety:
+
+| | Untrusted | Authored |
+|---|---|---|
+| `include` / `extends` / `import`, `macro`, `set`, `with` | ✗ | ✓ |
+| Full filter and method sets | ✗ | ✓ |
+| Nested loops | ✗ (depth 1) | ✓ (depth 4) |
+| Expression size and bracket-depth guards | ✓ | ✓ |
+| Iterable and string length caps | ✓ | ✓ |
+| Output budget | ✓ | ✓ |
+| Macro-recursion depth counter | n/a (no macros) | ✓ |
+
+Loader contains the resolved partial set plus the template source under a per-render random
+key. `StrictUndefined = true`.
+
+**Partials are tenant-scoped.** `prompt_partials` carries a tenant column and the loader is
+built per tenant, so `{% include %}` cannot reach another tenant's content. Neither the
+existing `prompts` nor `prompt_versions` tables carry a tenant column today; if the fork's
+deployment is genuinely single-admin, record that as an explicit trust assumption rather than
+leaving it implied.
 
 `{% include %}`, `{% extends %}`, and `{% import %}` are replaced with custom implementations
 that carry a depth counter in the execution context. gonja's own `include` recurses through
@@ -247,8 +275,9 @@ input.
 | `max_output_bytes` | 1 MiB per **request** | Counting `io.Writer`; see caveat below |
 | `max_template_bytes` | 256 KiB | Checked before parse |
 | `max_include_depth` | 8 | Counter inside the replacement `include`/`extends`/`import`, authored environment only |
-| `max_expression_depth` | 64 | Pre-parse byte scan; guards parser recursion |
-| `max_loop_depth` | 2 | Post-parse AST walk, **fail-closed type switch**; also rejects `{% for … recursive %}` |
+| `max_expression_bytes` | 256 | Size of any single `{{ }}` / `{% %}` region; the class-level bound |
+| `max_expression_depth` | 32 | Bracket nesting within one expression; guards parser recursion |
+| `max_loop_depth` | 1 untrusted / 4 authored | Post-parse AST walk, **fail-closed type switch**; also rejects `{% for … recursive %}` |
 | `max_iterable_len` | 1 000 | Variable map validated before render; **strings count by length** |
 | `render_timeout` | 250 ms | Render runs in a goroutine; caller abandons on timeout |
 
@@ -305,6 +334,8 @@ no filesystem access, and none is stopped by the earlier single-environment desi
 | Nested `{% for %}` over a 20 000-element client array | 4×10⁸ iterations, zero output | `max_iterable_len` + `max_loop_depth` |
 | `{{ ((((…1…)))) }}` at 60 000 depth, 120 KB | **Fatal stack overflow in the parser; process exits**, `recover()` cannot catch it | `max_expression_depth`, checked before parse |
 | `{{ s \| center(200000000) }}` — 27 bytes, no control structures | 1091 MB allocated before the writer sees a byte | Filter allowlist |
+| `{{ s.zfill(200000000) }}` | 572 MB; same sizing operation reached via a string *method*, bypassing the filter allowlist | No methods in the untrusted environment |
+| `{{ a.b.b.b… }}` — 4 KB, no brackets, no loops, no variables | 2792 MB, O(n³); passed the bracket-depth guard, the size cap, the loop guard and the iterable cap, emitting zero output | `max_expression_bytes` |
 | `{{ s * 100000000 }}` | 286 MB allocated | `*` operator clamped |
 | 3-deep loop nest inside `{% if %}` or `{% with %}` | 25 GB; the reflective walker counted it as depth 0 | Fail-closed type-switch walk; `with` dropped |
 | `{% for c in big %}` over a 200 KB string variable | 345 MB at loop depth 1 | String length counts toward `max_iterable_len` |
@@ -312,6 +343,18 @@ no filesystem access, and none is stopped by the earlier single-environment desi
 Variable *values* are not re-parsed as templates, so there is no second-order injection through
 `variables` — a value containing `{% include %}` renders literally. That property is relied
 upon and must be covered by a regression test.
+
+**The lesson this table encodes.** Three review rounds each found that a guard bounded the
+specific *shape* last discovered, and the next attack simply used a different shape: blocking
+filesystem access did not stop control structures; restricting control structures did not stop
+the parser or the expression layer; bounding bracket nesting did not stop attribute chains.
+`max_expression_bytes` is the first guard here that bounds a *class* — the cost of any
+expression, whatever its syntax — rather than an instance. Prefer that shape of guard. When
+adding one, ask what it fails to bound, not what it blocks.
+
+Errors from a failed render are truncated before logging. The attribute-chain attack produces
+a 16 MB error string, and the spec requires every fallback to be logged; without truncation the
+DoS simply relocates to the log pipeline.
 
 ## Undefined-variable semantics
 

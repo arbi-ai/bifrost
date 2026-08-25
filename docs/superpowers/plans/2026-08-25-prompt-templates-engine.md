@@ -491,7 +491,9 @@ import (
 	"github.com/nikolalohinski/gonja/v2/builtins"
 	"github.com/nikolalohinski/gonja/v2/config"
 	"github.com/nikolalohinski/gonja/v2/exec"
+	controlStructures "github.com/nikolalohinski/gonja/v2/builtins/control_structures"
 	"github.com/nikolalohinski/gonja/v2/loaders"
+	"github.com/nikolalohinski/gonja/v2/nodes"
 	"github.com/stretchr/testify/require"
 )
 
@@ -640,6 +642,16 @@ func walkNode(n nodes.Node, depth, maxDepth int) error {
 	case nil:
 		return nil
 
+	// The parse tree wraps every control structure in a ControlStructureBlock;
+	// the concrete *ForControlStructure / *IfControlStructure types are NEVER
+	// direct children of a Template or Wrapper. Omitting this case makes the
+	// switch fall through to default for every control structure, so the guard
+	// rejects all of them and the untrusted renderer silently renders nothing
+	// but bare {{ var }}. Verified: {% if %} and {% for %} both arrive here as
+	// *nodes.ControlStructureBlock.
+	case *nodes.ControlStructureBlock:
+		return walkNode(typed.ControlStructure, depth, maxDepth)
+
 	// Leaves: carry no child nodes, so nothing can hide inside them.
 	case *nodes.Output, *nodes.Data, *nodes.Comment:
 		return nil
@@ -717,6 +729,7 @@ Create `engine/vars_test.go`:
 package engine_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/arbi-ai/bifrost-prompt-templates/engine"
@@ -789,7 +802,10 @@ Create `engine/vars.go`:
 ```go
 package engine
 
-import "errors"
+import (
+	"errors"
+	"reflect"
+)
 
 // ErrIterableTooLarge reports a variable holding a collection longer than the
 // permitted maximum. Combined with the loop-depth guard this bounds total
@@ -906,8 +922,8 @@ The single most severe finding in review. gonja's **parser** is not recursion-sa
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
-  - `func GuardExpressionDepth(src string, maxDepth int) error`
-  - `var ErrExpressionTooDeep = errors.New("template expression nesting is too deep")`
+  - `func GuardExpressions(src string, maxBytes, maxDepth int) error`
+  - `var ErrExpressionTooDeep`, `var ErrExpressionTooLarge`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -931,7 +947,7 @@ func TestDepthGuardAllowsOrdinaryTemplates(t *testing.T) {
 		`{% for o in orders %}{{ o.items[0].price }}{% endfor %}`,
 		`{{ user.profile.city | default('unknown') }}`,
 	} {
-		require.NoError(t, engine.GuardExpressionDepth(src, 64), src)
+		require.NoError(t, engine.GuardExpressions(src, 64), src)
 	}
 }
 
@@ -943,14 +959,14 @@ func TestDepthGuardRejectsDeepNesting(t *testing.T) {
 		{"(", ")"}, {"[", "]"}, {"{", "}"},
 	} {
 		src := "{{ " + strings.Repeat(pair.open, 500) + "1" + strings.Repeat(pair.close, 500) + " }}"
-		require.ErrorIs(t, engine.GuardExpressionDepth(src, 64), engine.ErrExpressionTooDeep)
+		require.ErrorIs(t, engine.GuardExpressions(src, 64), engine.ErrExpressionTooDeep)
 	}
 }
 
 // Depth must not accumulate across independent expressions.
 func TestDepthGuardResetsBetweenExpressions(t *testing.T) {
 	src := strings.Repeat("{{ ((a)) }} ", 1000)
-	require.NoError(t, engine.GuardExpressionDepth(src, 64))
+	require.NoError(t, engine.GuardExpressions(src, 64))
 }
 
 // Braces inside a raw block or literal text still count. The guard is a byte
@@ -958,14 +974,14 @@ func TestDepthGuardResetsBetweenExpressions(t *testing.T) {
 // exotic message is acceptable; under-rejecting kills the process.
 func TestDepthGuardIsConservative(t *testing.T) {
 	src := "{{ " + strings.Repeat("(", 100) + " }}"
-	require.ErrorIs(t, engine.GuardExpressionDepth(src, 64), engine.ErrExpressionTooDeep)
+	require.ErrorIs(t, engine.GuardExpressions(src, 64), engine.ErrExpressionTooDeep)
 }
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
 
 Run: `go test ./engine/ -run TestDepthGuard -v`
-Expected: FAIL — `undefined: engine.GuardExpressionDepth`.
+Expected: FAIL — `undefined: engine.GuardExpressions`.
 
 - [ ] **Step 3: Implement**
 
@@ -974,54 +990,94 @@ Create `engine/depthguard.go`:
 ```go
 package engine
 
-import "errors"
+import (
+	"errors"
+	"strings"
+)
 
-// ErrExpressionTooDeep reports bracket nesting beyond the permitted depth.
-var ErrExpressionTooDeep = errors.New("template expression nesting is too deep")
+var (
+	// ErrExpressionTooDeep reports bracket nesting beyond the permitted depth.
+	ErrExpressionTooDeep = errors.New("template expression nesting is too deep")
 
-// GuardExpressionDepth rejects source whose bracket nesting could overflow
-// gonja's recursive-descent parser.
+	// ErrExpressionTooLarge reports a single {{ }} or {% %} region longer than
+	// the permitted size. This is the class-level bound: it constrains parse and
+	// evaluation cost for every expression shape, not just bracketed ones.
+	ErrExpressionTooLarge = errors.New("template expression is too large")
+)
+
+// GuardExpressions bounds the size and bracket nesting of every template
+// expression, scanning only inside {{ … }} and {% … %} regions.
 //
-// This MUST run before exec.NewTemplate. The parser recurses per nesting level
-// and overflows the goroutine stack fatally: 60 000 nested parens is 120 007
-// bytes, passes any reasonable size cap, and exits the process with an error
-// recover() cannot intercept. No post-parse guard can help, because the parse
-// tree never exists.
+// It MUST run before exec.NewTemplate, and it bounds expression SIZE rather
+// than any particular syntactic shape. That distinction is the whole point:
 //
-// The scan is a single pass with three counters and does not attempt to
-// understand string literals, comments or raw blocks. Over-rejecting an exotic
-// message costs one verbatim fallback; under-rejecting costs the process.
-func GuardExpressionDepth(src string, maxDepth int) error {
+//   - Bracket nesting alone is not enough. 4 KB of {{ a.b.b.b… }} contains no
+//     brackets at all, passed a bracket-depth guard, a 64 KiB size cap, the
+//     loop guard (no loops) and the iterable cap (no variables), emitted zero
+//     output bytes — and allocated 2792 MB. Allocation is O(n³) in chain
+//     length and the error message is O(n²).
+//   - .attr was simply the first non-bracket recursion found. Bounding the
+//     length of any single expression bounds parse and evaluation cost for
+//     every shape, including ones not yet discovered.
+//
+// Scanning only inside delimiters also fixes a false-positive: counting braces
+// across the whole message rejected plain prose containing 65 unmatched '{'
+// characters — code snippets, logs, markdown — which is common in chat text.
+func GuardExpressions(src string, maxBytes, maxDepth int) error {
+	for i := 0; i+1 < len(src); i++ {
+		if src[i] != '{' || (src[i+1] != '{' && src[i+1] != '%') {
+			continue
+		}
+		closer := "}}"
+		if src[i+1] == '%' {
+			closer = "%}"
+		}
+		end := strings.Index(src[i+2:], closer)
+		if end < 0 {
+			// Unterminated delimiter: let the parser produce the error, which
+			// triggers the ordinary verbatim fallback.
+			return nil
+		}
+		region := src[i+2 : i+2+end]
+		if len(region) > maxBytes {
+			return ErrExpressionTooLarge
+		}
+		if err := guardBracketDepth(region, maxDepth); err != nil {
+			return err
+		}
+		i += 2 + end
+	}
+	return nil
+}
+
+// guardBracketDepth bounds nesting within one expression, so the parser's
+// recursive descent cannot overflow the stack. 60 000 nested parens is a fatal
+// stack overflow inside exec.NewTemplate that recover() cannot intercept.
+func guardBracketDepth(region string, maxDepth int) error {
 	var round, square, curly int
-	for i := 0; i < len(src); i++ {
-		switch src[i] {
+	for i := 0; i < len(region); i++ {
+		switch region[i] {
 		case '(':
 			round++
-			if round > maxDepth {
-				return ErrExpressionTooDeep
-			}
 		case ')':
 			if round > 0 {
 				round--
 			}
 		case '[':
 			square++
-			if square > maxDepth {
-				return ErrExpressionTooDeep
-			}
 		case ']':
 			if square > 0 {
 				square--
 			}
 		case '{':
 			curly++
-			if curly > maxDepth {
-				return ErrExpressionTooDeep
-			}
 		case '}':
 			if curly > 0 {
 				curly--
 			}
+		}
+		if round > maxDepth || square > maxDepth || curly > maxDepth {
+			return ErrExpressionTooDeep
 		}
 	}
 	return nil
@@ -1054,7 +1110,7 @@ A 27-byte template with no control structure allocates a gigabyte. The control-s
 - Consumes: nothing.
 - Produces:
   - `func UntrustedFilters() *exec.FilterSet`
-  - `var UntrustedFilterDenylist = []string{...}`
+  - `func UntrustedFilterAllowlist() []string`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1075,7 +1131,12 @@ import (
 // output cap, loop guard and iterable cap are all bypassed at once.
 func TestUntrustedFiltersDropSizingFilters(t *testing.T) {
 	fs := engine.UntrustedFilters()
-	for _, name := range engine.UntrustedFilterDenylist {
+	// Each allocates proportionally to a caller-supplied integer, materialising
+	// the value before the budgeted writer sees it.
+	for _, name := range []string{
+		"center", "indent", "wordwrap", "truncate", "format",
+		"filesizeformat", "batch", "slice", "list",
+	} {
 		require.False(t, fs.Exists(name), "%s must not be available to untrusted templates", name)
 	}
 }
@@ -1084,6 +1145,15 @@ func TestUntrustedFiltersKeepOrdinaryFilters(t *testing.T) {
 	fs := engine.UntrustedFilters()
 	for _, name := range []string{"upper", "lower", "default", "join", "length", "trim"} {
 		require.True(t, fs.Exists(name), "%s should remain available", name)
+	}
+}
+
+// A typo in the allowlist silently degrades a filter to unavailable, because the
+// build loop skips names gonja does not define.
+func TestUntrustedFilterAllowlistNamesAllResolve(t *testing.T) {
+	fs := engine.UntrustedFilters()
+	for _, name := range engine.UntrustedFilterAllowlist() {
+		require.True(t, fs.Exists(name), "allowlisted filter %q does not exist in gonja", name)
 	}
 }
 ```
@@ -1105,43 +1175,46 @@ import (
 	"github.com/nikolalohinski/gonja/v2/exec"
 )
 
-// UntrustedFilterDenylist names filters unavailable to end-user text because
-// they allocate proportionally to a caller-supplied numeric argument.
+// untrustedFilterAllowlist is the complete set of filters available to end-user
+// text. This is an ALLOWLIST, not a denylist, for the same reason the control
+// structures are: exec.FilterSet exposes only Exists/Get/Register/Replace/Update
+// and NO enumeration, and builtins.FilterNames() does not exist — so the builtin
+// set cannot be subtracted from. Hardcoding is the only viable mechanism.
 //
-// Verified: {{ s | center(200000000) }} is 27 bytes and allocates 1091 MB,
-// producing 200 MB of output that never reaches the budgeted writer, because
-// the value is built in memory first.
-var UntrustedFilterDenylist = []string{
-	"center", "indent", "wordwrap", "truncate", "format",
-	"filesizeformat", "batch", "slice", "list",
+// Excluded by construction: every filter that allocates proportionally to a
+// caller-supplied integer. {{ s | center(200000000) }} is 27 bytes and
+// allocates 1091 MB, producing output that never reaches the budgeted writer
+// because the value is materialised in memory first. center, indent, wordwrap,
+// truncate, format, filesizeformat, batch, slice and list are all absent below
+// and must stay absent.
+//
+// Adding a filter here requires checking that its cost is bounded by its INPUT,
+// not by an argument.
+var untrustedFilterAllowlist = []string{
+	"upper", "lower", "capitalize", "title", "trim", "striptags", "escape",
+	"default", "length", "join", "first", "last", "reverse", "sort", "unique",
+	"int", "float", "string", "abs", "round", "replace", "urlencode", "tojson",
 }
 
-// UntrustedFilters returns the builtin filter set minus UntrustedFilterDenylist.
-//
-// Unlike control structures, filters are denylisted rather than allowlisted:
-// the builtin set is large and mostly harmless string manipulation, and an
-// allowlist would silently break ordinary templates on every gonja upgrade.
-// The denylist is covered by a test that fails if a named filter disappears.
-func UntrustedFilters() *exec.FilterSet {
-	denied := make(map[string]struct{}, len(UntrustedFilterDenylist))
-	for _, name := range UntrustedFilterDenylist {
-		denied[name] = struct{}{}
-	}
+// UntrustedFilterAllowlist exposes the allowlist for testing.
+func UntrustedFilterAllowlist() []string {
+	out := make([]string, len(untrustedFilterAllowlist))
+	copy(out, untrustedFilterAllowlist)
+	return out
+}
 
-	allowed := make(map[string]exec.FilterFunction)
-	for _, name := range builtins.FilterNames() {
-		if _, blocked := denied[name]; blocked {
-			continue
-		}
+// UntrustedFilters returns a filter set containing only untrustedFilterAllowlist.
+func UntrustedFilters() *exec.FilterSet {
+	allowed := make(map[string]exec.FilterFunction, len(untrustedFilterAllowlist))
+	for _, name := range untrustedFilterAllowlist {
 		if fn, ok := builtins.Filters.Get(name); ok {
 			allowed[name] = fn
 		}
 	}
 	return exec.NewFilterSet(allowed)
 }
-```
 
-**Implementer note:** `builtins.FilterNames()` may not exist. If it does not, enumerate names from the `builtins.Filters` map directly — check `exec.FilterSet` for an exported accessor mirroring `ControlStructureSet.Get`/`Exists`, and if the set exposes no enumeration at all, build `allowed` from an explicit list of the filters this project supports and document that upgrading gonja requires revisiting it. Do not fall back to `builtins.Filters` unmodified: that reintroduces the gigabyte allocation.
+**Implementer note:** verify each allowlisted name actually resolves via `builtins.Filters.Get`. A name gonja does not define is silently skipped by the loop, so a typo degrades a filter to "unavailable" rather than failing loudly — the test below catches that. Do NOT fall back to `builtins.Filters` unmodified: that reintroduces the gigabyte allocation.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1168,7 +1241,7 @@ Assembles Tasks 2–5 into the render-or-return-verbatim path that runs on every
 **Interfaces:**
 - Consumes: `UntrustedControlStructures`, `NewBudget`, `GuardLoops`, `Allowlist`, `CheckIterables`.
 - Produces:
-  - `type Limits struct{ MaxOutputBytes int64; MaxTemplateBytes int; MaxLoopDepth int; MaxIterableLen int }`
+  - `type Limits struct{ MaxOutputBytes int64; MaxTemplateBytes, MaxExpressionBytes, MaxExpressionDepth, MaxLoopDepth, MaxIterableLen, MaxStringLen int }`
   - `func DefaultLimits() Limits`
   - `type Outcome struct{ Rendered bool; Err error }`
   - `type Untrusted struct{ ... }`
@@ -1319,6 +1392,7 @@ const untrustedKey = "/__msg__"
 type Limits struct {
 	MaxOutputBytes     int64
 	MaxTemplateBytes   int
+	MaxExpressionBytes int
 	MaxExpressionDepth int
 	MaxLoopDepth       int
 	MaxIterableLen     int
@@ -1331,7 +1405,12 @@ func DefaultLimits() Limits {
 		MaxTemplateBytes: 64 << 10,
 		// Bounds parser recursion. 120KB of nested parens — under the old 256KiB
 		// template limit — caused a fatal stack overflow inside exec.NewTemplate.
-		MaxExpressionDepth: 64,
+		// Bounds the SIZE of any single {{ }} / {% %} region. This is the guard
+		// that catches shapes not yet discovered: 4KB of {{ a.b.b.b... }} has no
+		// brackets and allocated 2792MB past every other guard. 256 bytes is
+		// generous for a real expression, including filter chains with defaults.
+		MaxExpressionBytes: 256,
+		MaxExpressionDepth: 32,
 		// Depth 1: no nested loops in end-user text. This is what makes the
 		// iteration bound safe. At depth 2 a long string variable yields 10^8
 		// iterations; at depth 1 the worst case is MaxStringLen, which is cheap.
@@ -1380,7 +1459,15 @@ func NewUntrusted(limits Limits) *Untrusted {
 			Filters:           UntrustedFilters(),
 			Tests:             builtins.Tests,
 			ControlStructures: UntrustedControlStructures(),
-			Methods:           builtins.Methods,
+			// NO methods. gonja's string methods include center, ljust, rjust,
+			// zfill, expandtabs, format and format_map -- the same sizing
+			// operations the filter allowlist excludes, reachable through
+			// different syntax: {{ s.zfill(200000000) }} allocates 572 MB and
+			// bypasses the filter restriction entirely. The method sets are
+			// unexported (builtins/methods/str.go), so they cannot be subtracted
+			// the way filters and control structures are. End-user text does not
+			// need methods: the allowlisted filters cover the same ground.
+			Methods: exec.Methods{},
 		},
 	}
 }
@@ -1399,7 +1486,7 @@ func (u *Untrusted) Render(src string, vars map[string]any, allowed []string, bu
 	// overflows the stack fatally on deeply nested expressions — a failure no
 	// recover() catches and no post-parse guard can reach, because the process
 	// is gone before the parse tree exists.
-	if err := GuardExpressionDepth(src, u.limits.MaxExpressionDepth); err != nil {
+	if err := GuardExpressions(src, u.limits.MaxExpressionBytes, u.limits.MaxExpressionDepth); err != nil {
 		return src, Outcome{Err: err}
 	}
 
