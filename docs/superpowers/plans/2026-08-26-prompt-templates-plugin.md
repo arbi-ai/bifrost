@@ -31,11 +31,42 @@
 | `schemas.ChatMessageContent` | `{ContentStr *string; ContentBlocks []ChatContentBlock}` — exactly one is set |
 | `schemas.ChatContentBlock` | `{Type; Text *string; Refusal *string; ImageURLStruct *ChatInputImage; InputAudio; File; ...}` |
 | `schemas.ChatInputImage` | `{URL string; FileID *string; Detail *string}` |
-| `schemas.ResponsesMessage` | `{Role *ResponsesMessageRoleType; Content *ResponsesMessageContent; ...}` |
+| `schemas.ResponsesMessage` | `{Role *ResponsesMessageRoleType; Content *ResponsesMessageContent; ...}` + **embedded** `*ResponsesToolMessage`, `*ResponsesReasoning` |
 | `schemas.ResponsesMessageContent` | `{ContentStr *string; ContentBlocks []ResponsesMessageContentBlock}` |
+| `schemas.ResponsesMessageContentBlock` | Named: `Type`, `Text *string`, `FileID`, `Signature`, `EncryptedContent`, `Audio`, `CacheControl`, `Citations`, `PromptCacheBreakpoint`. **Embedded pointers**: `*ResponsesInputMessageContentBlockImage`, `*ResponsesInputMessageContentBlockFile` |
 | `schemas.HTTPRequest` / `HTTPResponse` | `{Method, Path, Headers, Query, Body []byte, PathParams}` / `{StatusCode, Headers, Body}` |
 
 Note `ChatMessageContent` is a two-field struct where exactly one field is populated, **not** an interface — walking it means checking both.
+
+`ChatContentBlock` also carries `CacheControl`, `Citations` (`{Enabled *bool}`), `PromptCacheBreakpoint` and `CachePoint`. None hold templatable text, so passing them through is correct — recorded here so the next reader does not re-derive it.
+
+### Embedded pointers: reading a promoted field can panic
+
+**This is the single most likely way to break Task 3.** `ChatMessage` and `ResponsesMessageContentBlock` promote fields through *embedded pointers*, and merely **reading** such a field when the embedding is nil is a nil dereference — no method call needed:
+
+```go
+var m schemas.ChatMessage          // a plain user message
+_ = m.Content                      // fine: named field
+_ = m.Refusal                      // PANICS: promoted through a nil *ChatAssistantMessage
+_ = m.ToolCalls                    // PANICS
+_ = m.ToolCallID                   // PANICS: nil *ChatToolMessage
+
+var b schemas.ResponsesMessageContentBlock  // a plain input text block
+_ = b.Text                         // fine: named field
+_ = b.ImageURL                     // PANICS: nil *ResponsesInputMessageContentBlockImage
+```
+
+The trap is that **the two paths differ**. On a Chat block, `Refusal *string` is a *named* field and `cb.Refusal` is safe. On a Responses block there is no top-level `Refusal` — it resolves through an embedded pointer and panics. Writing the Responses walk "by analogy" with Chat therefore panics on an input text block carrying only `Type` and `Text`, which is the most common shape a client sends.
+
+**Rule: nil-check the embedding, never the promoted field.**
+
+```go
+if b.ResponsesInputMessageContentBlockImage != nil {
+    // b.ImageURL is now safe to read
+}
+```
+
+And **"passed through untouched" means not referenced at all** — not "read and then ignored".
 
 ---
 
@@ -117,8 +148,8 @@ The renderers take a string; a Bifrost request holds structured messages. This t
 
 **Interfaces:**
 - Produces:
-  - `func RenderChatMessages(msgs []schemas.ChatMessage, r TextRenderer) []Outcome`
-  - `func RenderResponsesMessages(msgs []schemas.ResponsesMessage, r TextRenderer) []Outcome`
+  - `func RenderChatMessages(msgs []schemas.ChatMessage, r TextRenderer) ([]schemas.ChatMessage, []Outcome)`
+  - `func RenderResponsesMessages(msgs []schemas.ResponsesMessage, r TextRenderer) ([]schemas.ResponsesMessage, []Outcome)`
   - `type TextRenderer func(s string) (string, error)`
 
 - [ ] **Step 1: Write the failing test**
@@ -126,18 +157,22 @@ The renderers take a string; a Bifrost request holds structured messages. This t
 The scope rules, each a test:
 
 - `ContentStr` is rendered.
-- Every `ContentBlocks` entry with `Type == text` has its `Text` rendered.
-- `ImageURLStruct.URL` **is** rendered — templated signed URLs are a real use case.
-- `InputAudio` and `File` blocks are passed through untouched (binary; nothing to template).
-- `Refusal` is passed through untouched — it is model output, not author or user input.
-- A `nil` `Content` is a no-op, not a panic.
-- Both `ContentStr` and `ContentBlocks` nil is a no-op.
-- Messages are mutated **in place**; the returned outcomes report per-message results.
-- The Responses path covers `ContentStr` and `ContentBlocks` equivalently.
+- Every `ContentBlocks` entry with `Type == text` has its `Text` rendered (`Text` is a named field on both block types — safe to read).
+- Chat: `ImageURLStruct.URL` **is** rendered — templated signed URLs are a real use case. `ImageURLStruct` is a named field, so nil-check it directly.
+- Responses: the image URL is `ResponsesInputMessageContentBlockImage.ImageURL *string`, reached through an **embedded pointer**. Render it for parity with Chat, guarded by `if b.ResponsesInputMessageContentBlockImage != nil`.
+- Audio and file blocks are passed through untouched — binary, nothing to template.
+- `Refusal` is passed through untouched, meaning **never read**. It is model output, and on the Responses path reading it panics.
+- Tool calls and tool arguments are **not** walked: out of scope for v1 per the spec. This is a deliberate gap, not an omission — see the note after these rules.
+- A `nil` `Content` is a no-op, not a panic. Both fields nil is a no-op.
+- **A plain user message — no assistant fields, no tool fields — walks without panicking.** This is the regression test for the embedded-pointer trap; write it first.
+- A Responses input text block carrying only `Type` and `Text` walks without panicking.
+- The walk renders into **copies** and returns them; it does not mutate in place. See Task 4.
+
+**On the tool-call gap.** The spec puts tool/function JSON out of scope for v1, and `ChatAssistantMessage.ToolCalls` / `ResponsesToolMessage.Arguments` are the only text-bearing fields excluded. Two consequences to document rather than discover: a stored prompt version *can* contain assistant few-shot turns with tool calls — the existing `prompts` plugin's `completion_result` envelope produces exactly that — so an author writing `{{ }}` inside tool arguments gets silence; and the walk must not so much as *read* `msg.ToolCalls` without nil-checking `msg.ChatAssistantMessage` first.
 
 - [ ] **Step 2: Run to verify it fails.**
 
-- [ ] **Step 3: Implement.** A straightforward walk. `ChatMessageContent` has exactly one of `ContentStr`/`ContentBlocks` populated, so check both and act on whichever is set.
+- [ ] **Step 3: Implement.** `ChatMessageContent` has exactly one of `ContentStr`/`ContentBlocks` populated, so check both and act on whichever is set. Guard every embedded-pointer access as above. Return rendered copies rather than mutating the caller's slice.
 
 - [ ] **Step 4: Run to verify it passes.**
 
@@ -158,15 +193,31 @@ The engine cannot bound wall-clock time: `exec.Template.Execute` takes no `conte
   - `func WithDeadline[T any](d time.Duration, fn func() (T, error)) (T, error)`
   - `var ErrRenderDeadline = errors.New("render deadline exceeded")`
 
+**Per REQUEST, not per render.** A per-render deadline lets N messages each finish just under it, for N × deadline total. Compute the deadline once in `PreLLMHook` and pass the remaining time down, mirroring `engine.Budget`, which the plan already shares per-request for exactly this reason.
+
+**The abandoned goroutine must not hold anything the request path still uses.** This is why Task 3 renders into copies rather than mutating in place: with in-place mutation, a timed-out render keeps rewriting the very messages the request has already carried on to the provider. Verified with the race detector against both tasks exactly as originally specified:
+
+```
+WARNING: DATA RACE
+  Read at 0x00c000014980 by main goroutine
+  Previous write at 0x00c000014980 by goroutine 8   (the abandoned render)
+```
+
+Neither task's own tests would catch it — Task 4 tests `WithDeadline` with a self-contained `fn`, Task 3 tests the walk with no deadline, and each passes `-race` alone. Commit rendered results to the request **only on success**, which also makes a deadline all-or-nothing instead of leaving a half-rendered request in flight.
+
+The render closure must likewise never capture the fasthttp `RequestCtx` — same hazard class, since that context is recycled.
+
 - [ ] **Step 1: Write the failing test**
 
-Cover: a fast function returns its value; a slow function returns `ErrRenderDeadline` within roughly the deadline; the slow goroutine finishing later does not panic on a closed channel or corrupt the result; and a panicking function surfaces as an error rather than killing the process.
+Cover: a fast function returns its value; a slow function returns `ErrRenderDeadline` within roughly the deadline; the slow goroutine finishing later does not panic on a closed channel or corrupt the result; a panicking function surfaces as an error rather than killing the process; and — the T2 regression — **a timed-out render that shares a slice with the caller does not race**, asserted under `-race` with the walk and the deadline composed as Task 7 composes them.
 
 - [ ] **Step 2: Run to verify it fails.**
 
 - [ ] **Step 3: Implement.** Run `fn` in a goroutine, select on a buffered result channel and a timer.
 
-**Document the limitation honestly in the code:** this **abandons** a slow render, it does not stop it. The goroutine keeps running until `fn` returns, holding its memory. That is why the engine's structural guards — restricted control structures, the expression-size bound, loop depth, iterable caps — are the primary controls and this is a backstop. A buffered channel is required so the abandoned goroutine's send never blocks forever and leaks.
+**Document the limitation honestly in the code:** this **abandons** a slow render, it does not stop it. The goroutine keeps running until `fn` returns, holding its memory. That is why the engine's structural guards — restricted control structures, the expression-size bound, loop depth, iterable caps — are the primary controls and this is a backstop.
+
+The result channel **must** be buffered (cap 1) so the late send never blocks; an unbuffered channel would leak the goroutine permanently rather than letting it exit and be collected. Beyond its own stack and allocations the abandoned goroutine leaks nothing — *provided* it shares no references with the request path, which is the constraint above.
 
 - [ ] **Step 4: Run to verify it passes** — with `-race`.
 
@@ -210,7 +261,7 @@ Three transport facts, each verified against the fork and each needing a test:
 
 - **`variables` must be stripped from `ExtraParams`.** `extractExtraParams` (`handlers/inference.go`) sweeps every field absent from `chatParamsKnownFields` / `responsesParamsKnownFields` into `Params.ExtraParams`, and `variables` is in neither list. Left in place, a caller sending `x-bf-passthrough-extra-params: true` gets it merged verbatim into the outgoing provider body and a 400 from upstream.
 - **Integration routes drop `variables` at parse.** `integrations/router.go` uses a plain `sonic.Unmarshal` into the integration's own request type, so an unknown top-level field is gone before any plugin runs. On `/openai/*` and friends the **header is the only working transport**. Test that the header path works and document the gap.
-- **Large bodies skip the body copy.** `fasthttpToHTTPRequest` (`handlers/middlewares.go`) does not populate `HTTPRequest.Body` above the large-payload threshold. Read `variables` from the **parsed request** in `PreLLMHook`, not from the raw body, and treat the transport hook's body read as an optimisation that may legitimately find nothing.
+- **The body copy is skipped far more often than "large bodies" suggests.** `fasthttpToHTTPRequest` (`handlers/middlewares.go`) skips it when content length exceeds the threshold **or is negative**. Unknown content length covers chunked transfer *and* anything that passed through streaming decompression, which deletes `Content-Length` — so an ordinary gzipped request loses its body in the transport hook regardless of size. The threshold itself is **10 MB** (`DefaultLargePayloadRequestThresholdBytes`, `core/schemas/bifrost.go`). Read `variables` from the **parsed request** in `PreLLMHook`; the transport hook's body read is an optimisation that finds nothing *routinely*, not exceptionally.
 
 - [ ] **Step 2–5:** as usual. Commit — `feat(plugin): transport hook and variable capture`
 
@@ -236,7 +287,7 @@ Three transport facts, each verified against the fork and each needing a test:
 1. No prompt header and no variables → request untouched, no error.
 2. A resolved prompt renders its stored messages through `engine.Authored` and **prepends** them to the client's input.
 3. Client messages render through `engine.Untrusted` with `render.DeclaredNames` as the allowlist.
-4. A missing variable in the **stored template** returns a short-circuit 400 whose body names the variables, via `engine.AsMissingVariables`.
+4. A missing variable in the **stored template** short-circuits with a 400 naming the variables, via `engine.AsMissingVariables`. `LLMPluginShortCircuit.Error` is a `*schemas.BifrostError` (`core/schemas/plugin_native.go`) carrying `StatusCode *int` and `Error *ErrorField` — not a raw HTTP body. Set `AllowFallbacks` false: a missing variable is not retryable against another provider.
 5. A missing variable in a **client message** leaves that message verbatim and does not fail the request.
 6. Variable precedence is version defaults → header → body.
 7. The cache key carries tenant, resolved version, partial fingerprint and per-message source hash.
@@ -248,7 +299,9 @@ Three transport facts, each verified against the fork and each needing a test:
 
 - [ ] **Step 3: Implement.**
 
-Order inside `PreLLMHook`: resolve → build partial set → merge variables → apply params → render stored messages (authored) → prepend → render client messages (untrusted) → return.
+Order inside `PreLLMHook`: resolve → build partial set → merge variables → apply params → **capture the client's message slice** → render stored messages (authored) → render the captured client messages (untrusted) → assemble `stored ++ client` → return.
+
+**Capture before prepending.** Reading `req.ChatRequest.Input` *after* prepending sends the stored template's output through `engine.Untrusted` for a second pass. That is wasted work, but it is also semantically wrong: the guarantee that variable values are not re-parsed holds *within* one render, not across two — a value containing template syntax is inert on pass 1 and live on pass 2. The untrusted set limits the blast radius (a parse error just falls back verbatim), but `{% raw %}` output and any literal `{{` a stored template deliberately emits would be mangled.
 
 **The `prompts` coexistence check belongs in `Init`, not per-request.** Both plugins write `BifrostContextKeySelectedPromptID`, and a context-key guard only works if `prompts` runs first — which tie-breaks on registration order (`lib/config.go`), and `prompts` has no reciprocal guard. `Init` returns an error naming both when `prompts` is also enabled. A hard boot failure is correct: the alternative is a silently doubled prompt on every request, discovered in production.
 
@@ -268,6 +321,8 @@ Order inside `PreLLMHook`: resolve → build partial set → merge variables →
 
 - [ ] **Step 2–5:** wire `case prompttemplates.PluginName` in `plugins.go`, add to the builtin list, add the config block, and implement the adapter mapping `configstoreTables.TablePrompt`/`TablePromptVersion` onto `store.PromptVersion`.
 
+**Set the plugin order explicitly, and pin it with a test.** Observed builtin placements: `prompts` 2, `governance` 4, `semanticcache` 7. A plugin registered without order info defaults to `PluginPlacementPostBuiltin` and would run **after** semantic cache — which would then key on the *unrendered* template, so two requests with different `variables` but the same stored prompt collide and return each other's cached responses. Call `SetPluginOrderInfo(..., builtinPlacement, schemas.Ptr(2))` to take the `prompts` slot. Governance at 4 running after us is correct: prepended messages must be visible to it.
+
 **Keep the fork diff small.** All logic lives in the module; this task is imports, a case, a config block and an adapter.
 
 Commit — `feat(transports): wire the prompt-templates plugin`
@@ -284,7 +339,7 @@ Commit — `feat(transports): wire the prompt-templates plugin`
 
 **Spec coverage.** Store interfaces → Task 1. Header/body variables → Tasks 2, 6. Rendering scope → Task 3. Deadline → Task 4. Param merge and the synthetic-key fix → Task 5. `ExtraParams` strip, integration-route gap, large-body caveat → Task 6. Precedence, strict-vs-lenient, cache keying, shared budget, fallback metering, `prompts` coexistence → Task 7. Fork wiring → Task 8.
 
-**Type consistency.** `store.PromptVersion` is defined in Task 1 and consumed in Tasks 5, 7, 8. `TextRenderer` is defined in Task 3 and consumed in Task 7. `Config` is defined in Task 7 and consumed in Task 8.
+**Type consistency.** `store.PromptVersion` is defined in Task 1 and consumed in Tasks 5, 7, 8. `TextRenderer` is defined in Task 3 and consumed in Task 7. `Config` is defined in Task 7 and consumed in Task 8. Task 3's renderers return copies, which Task 7 commits only on success.
 
 **Verified, not assumed.** Every Bifrost type in the table above was read from the fork before writing. Two shapes are easy to get wrong and are called out where used: `ChatMessageContent` is a two-field struct with exactly one field populated rather than an interface, and `ChatContentBlock` carries the image URL under `ImageURLStruct.URL` rather than a plain string field.
 
