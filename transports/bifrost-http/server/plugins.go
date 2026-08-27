@@ -6,6 +6,7 @@ import (
 	"math"
 	"slices"
 
+	prompttemplates "github.com/arbi-ai/bifrost-prompt-templates/plugin"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/plugins/compat"
 	"github.com/maximhq/bifrost/plugins/governance"
@@ -76,6 +77,27 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 
 	case prompts.PluginName:
 		return prompts.Init(ctx, bifrostConfig.ConfigStore, logger)
+
+	case prompttemplates.PluginName:
+		ptConfig, err := MarshalPluginConfig[prompttemplates.Config](pluginConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal prompt-templates plugin config: %w", err)
+		}
+		if ptConfig == nil {
+			ptConfig = &prompttemplates.Config{}
+		}
+		// Init refuses to construct when the prompts plugin is also enabled:
+		// both inject a prompt, so running the pair silently doubles it. The
+		// registration below disables prompts, and this is the backstop for a
+		// config that enables it by another route.
+		ptConfig.EnabledPlugins = enabledPluginNames(bifrostConfig)
+		return prompttemplates.Init(
+			ctx,
+			NewPromptTemplatesStore(bifrostConfig.ConfigStore),
+			PromptTemplatesPartialStore{},
+			ptConfig,
+			logger,
+		)
 
 	case logging.PluginName:
 		loggingConfig, err := MarshalPluginConfig[logging.Config](pluginConfig)
@@ -184,6 +206,26 @@ func (s *BifrostHTTPServer) getPluginConfig(name string) *schemas.PluginConfig {
 	return nil
 }
 
+// enabledPluginNames lists every plugin the config enables, for plugins that
+// must refuse to run alongside another.
+func enabledPluginNames(bifrostConfig *lib.Config) []string {
+	names := make([]string, 0, len(bifrostConfig.PluginConfigs))
+	for _, cfg := range bifrostConfig.PluginConfigs {
+		if cfg != nil && cfg.Enabled {
+			names = append(names, cfg.Name)
+		}
+	}
+	return names
+}
+
+// promptTemplatesEnabled reports whether the prompt-templates plugin should
+// take over from the built-in prompts plugin. It is opt-in: absent config
+// leaves the existing prompts behaviour untouched.
+func (s *BifrostHTTPServer) promptTemplatesEnabled() bool {
+	cfg := s.getPluginConfig(prompttemplates.PluginName)
+	return cfg != nil && cfg.Enabled
+}
+
 // loadBuiltinPlugins loads required built-in plugins in specific order
 func (s *BifrostHTTPServer) loadBuiltinPlugins(ctx context.Context) error {
 	builtinPlacement := schemas.Ptr(schemas.PluginPlacementBuiltin)
@@ -203,11 +245,37 @@ func (s *BifrostHTTPServer) loadBuiltinPlugins(ctx context.Context) error {
 	}
 	s.Config.SetPluginOrderInfo(telemetry.PluginName, builtinPlacement, schemas.Ptr(1))
 
-	// 2. Prompts (requires config store for prompt repository; disabled in enterprise)
-	if s.Config.ConfigStore != nil && ctx.Value(schemas.BifrostContextKeyIsEnterprise) == nil {
-		s.registerPluginWithStatus(ctx, prompts.PluginName, nil, nil, false)
-	} else {
+	// 2. Prompts, or prompt-templates in its place.
+	//
+	// The two are mutually exclusive: both inject a stored prompt, so running
+	// them together would silently double it on every request. prompt-templates
+	// is opt-in and takes the slot when enabled.
+	//
+	// Slot 2 is not cosmetic. A plugin registered without order info defaults to
+	// PluginPlacementPostBuiltin and would run AFTER semantic cache (slot 7),
+	// which would then key on the UNRENDERED template — so two requests with
+	// different variables but the same stored prompt would collide and return
+	// each other's cached responses. Governance (slot 4) running after us is
+	// correct: prepended messages must be visible to it.
+	usePromptTemplates := s.promptTemplatesEnabled()
+	promptsAvailable := s.Config.ConfigStore != nil && ctx.Value(schemas.BifrostContextKeyIsEnterprise) == nil
+
+	if usePromptTemplates && promptsAvailable {
+		pluginCfg := s.getPluginConfig(prompttemplates.PluginName)
+		var ptConfig any
+		if pluginCfg != nil {
+			ptConfig = pluginCfg.Config
+		}
+		s.registerPluginWithStatus(ctx, prompttemplates.PluginName, nil, ptConfig, false)
 		s.markPluginDisabled(prompts.PluginName)
+		s.Config.SetPluginOrderInfo(prompttemplates.PluginName, builtinPlacement, schemas.Ptr(2))
+	} else {
+		if promptsAvailable {
+			s.registerPluginWithStatus(ctx, prompts.PluginName, nil, nil, false)
+		} else {
+			s.markPluginDisabled(prompts.PluginName)
+		}
+		s.markPluginDisabled(prompttemplates.PluginName)
 	}
 	s.Config.SetPluginOrderInfo(prompts.PluginName, builtinPlacement, schemas.Ptr(2))
 

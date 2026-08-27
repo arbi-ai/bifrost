@@ -2278,7 +2278,7 @@
           },
           "name": {
             "type": "string",
-            "description": "Name of the plugin (built-in: telemetry, prompts, logging, governance, maxim, semantic_cache, otel, or custom plugin name)"
+            "description": "Name of the plugin (built-in: telemetry, prompts, prompt-templates, logging, governance, maxim, semantic_cache, otel, or custom plugin name). Note: prompt-templates supersedes prompts and the two are mutually exclusive — enabling prompt-templates disables prompts, since both inject a stored prompt and running the pair would double it."
           },
           "config": {
             "type": "object",
