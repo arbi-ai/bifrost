@@ -238,11 +238,31 @@ The result channel **must** be buffered (cap 1) so the late send never blocks; a
 
 Ported from `plugins/prompts/main.go`: version params are defaults, request params win. The marshal-merge-unmarshal round trip is safe because every `ChatParameters` field is an `omitempty` pointer, so request zero-values cannot clobber version defaults.
 
+**CORRECTED after measurement.** This task originally said to extend `knownSyntheticChatParamKeys` to the Responses path. That is wrong, and implementing it would have introduced a silent data-loss bug. Probed against the real types:
+
+| Input | Chat | Responses |
+|---|---|---|
+| `reasoning_effort` | consumed → `.Reasoning.Effort`; re-marshals as `reasoning` | **not** consumed; `.Reasoning` stays nil |
+| `reasoning_display` | consumed → `.Reasoning.Display` | not consumed; no `Display` field exists |
+| flat + nested together | `UnmarshalJSON` **errors** | flat ignored, nested wins |
+
+`ResponsesParameters` has no custom `UnmarshalJSON`, so it promotes nothing. Skipping the key there would drop the setting entirely rather than prevent a duplicate — the skip list is only correct where the key is actually consumed.
+
+Three distinct inherited bugs follow, and the fix addresses them together:
+
+1. **Responses files the key wrongly** — it reaches the provider as a bogus top-level `reasoning_effort` while `.Reasoning` is nil.
+2. **`reasoning_display` is a third shorthand the list omits** — on Chat it is promoted *and* duplicated into `ExtraParams`, reaching the provider twice.
+3. **The conflict case discards everything** — a version using the shorthand plus a client sending nested `reasoning` makes the Chat unmarshal error, and the original logs a warning and returns early, dropping *every* version param, not just the reasoning one. This is the ordinary case, not an edge one.
+
+**Fix:** fold each source's flat shorthands into that source's own nested `reasoning` object *before* merging, then delete the flat key. Order matters — normalising after the merge cannot tell a version shorthand from a request nested value. The key is then absent from the merged map, so no skip list is needed and all three modes go away at once. A single source carrying both forms stays an error: there is no precedence rule between two values written by the same author.
+
+Note the fold sets differ per path: Chat folds `effort`/`max_tokens`/`display`, Responses folds `effort`/`max_tokens` only, so `reasoning_display` correctly remains an extra param on the Responses path rather than being invented away.
+
 - [ ] **Step 1: Write the failing test**
 
-Cover: version params apply when the request omits them; request params win; unrecognised keys land in `ExtraParams`; and — the inherited bug this port **fixes** — `knownSyntheticChatParamKeys` (`reasoning_effort`, `reasoning_max_tokens`) are not misfiled into `ExtraParams` on **either** path. The original guards the Chat path only, so the Responses path files them wrongly.
+Cover: version params apply when the request omits them; request params win; unrecognised keys land in `ExtraParams`; request `ExtraParams` outrank version defaults; empty version params are a no-op. Then one test per bug above, plus the mirror case (request shorthand beats version nested) and a malformed version param surfacing as an error rather than a silent drop.
 
-- [ ] **Step 2–5:** as usual. Commit — `feat(plugin): model parameter merge with the synthetic-key guard on both paths`
+- [ ] **Step 2–5:** as usual. Commit — `feat(plugin): model parameter merge, resolving reasoning shorthands before merge`
 
 ---
 
