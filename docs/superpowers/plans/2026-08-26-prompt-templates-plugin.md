@@ -339,6 +339,12 @@ Order inside `PreLLMHook`: resolve → build partial set → merge variables →
 
 - [ ] **Step 1: Write the failing test** — a transport-level integration test issuing `POST /v1/chat/completions` with `x-bf-prompt-id` and a body `variables` object, asserting the rendered prompt reaches the provider mock.
 
+**Not achievable as written; substituted.** The `transports` binary does not build on this branch at all: `bifrost-http/main.go` embeds `all:ui`, which needs a built UI, and `bifrost-http/server/batch_accounting.go` imports `framework/batchaccounting`, which is **absent from the pinned `framework v1.5.9`** — both pre-existing, both unrelated to this work. Verified by stashing every change and rebuilding.
+
+Substituted: package-level tests against the adapter (`prompttemplates_test.go`), covering latest-vs-explicit version resolution, all three stored-envelope shapes plus the `MessageJSON` fallback column, declared-but-empty variable defaults surviving the widening, model-param passthrough, text-block joining, and non-text-block rejection. The end-to-end path remains unexercised; that gap is real and should be closed once the binary builds.
+
+**Local resolution uses `go.work`,** which is already gitignored and already required on this branch for the `batchaccounting` reason above. `transports/go.mod` is left untouched: a `replace` pointing outside the repo would break a fresh clone.
+
 - [ ] **Step 2–5:** wire `case prompttemplates.PluginName` in `plugins.go`, add to the builtin list, add the config block, and implement the adapter mapping `configstoreTables.TablePrompt`/`TablePromptVersion` onto `store.PromptVersion`.
 
 **Set the plugin order explicitly, and pin it with a test.** Observed builtin placements: `prompts` 2, `governance` 4, `semanticcache` 7. A plugin registered without order info defaults to `PluginPlacementPostBuiltin` and would run **after** semantic cache — which would then key on the *unrendered* template, so two requests with different `variables` but the same stored prompt collide and return each other's cached responses. Call `SetPluginOrderInfo(..., builtinPlacement, schemas.Ptr(2))` to take the `prompts` slot. Governance at 4 running after us is correct: prepended messages must be visible to it.
