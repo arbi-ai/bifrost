@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/andybalholm/brotli v1.2.2
-	github.com/arbi-ai/bifrost-prompt-templates v0.1.1
+	github.com/arbi-ai/bifrost-prompt-templates v0.2.0
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.10
 	github.com/bytedance/sonic v1.15.3-0.20260730064818-2a36d6da63e2
 	github.com/fasthttp/router v1.5.4
